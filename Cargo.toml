@@ -1,6 +1,6 @@
 [package]
 name = "sesh"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Named persistent shell sessions — zero config, single binary"
 license = "MIT"
