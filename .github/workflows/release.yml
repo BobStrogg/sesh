@@ -108,6 +108,7 @@ jobs:
           mkdir -p npm/bin
           cp artifacts/* npm/bin/
           chmod +x npm/bin/*
+          cp README.md npm/
 
           # Sync version from tag
           VERSION="${GITHUB_REF_NAME#v}"
