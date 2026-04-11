@@ -965,7 +965,8 @@ fn kill_session(name: &str) {
 }
 
 // ── Remote support ────────────────────────────────────────────────────────
-const NPM_PACKAGE: &str = "sesh-cli";
+const NPM_PACKAGE: &str = "@bobstrogg/sesh";
+const GITHUB_RELEASE_URL: &str = "https://github.com/BobStrogg/sesh/releases/latest/download";
 
 /// Detect remote OS/arch and return the binary name (e.g. "sesh-linux-x86_64").
 fn detect_remote_platform(host: &str) -> Option<String> {
@@ -1028,9 +1029,29 @@ fn deploy_to_remote(host: &str) -> bool {
             return true;
         }
     }
-    eprintln!("  npm not available on remote");
+    eprintln!("  npm not available on remote, trying GitHub release...");
 
-    // Method 2: Fallback — copy local binary ONLY if same platform
+    // Method 2: Download from GitHub releases via curl/wget
+    let download_cmd = format!(
+        "mkdir -p ~/.local/bin && \
+         (command -v curl >/dev/null 2>&1 && curl -fsSL -o ~/.local/bin/sesh {GITHUB_RELEASE_URL}/{binary_name} || \
+          command -v wget >/dev/null 2>&1 && wget -qO ~/.local/bin/sesh {GITHUB_RELEASE_URL}/{binary_name} || \
+          echo 'SESH_DOWNLOAD_FAIL') && \
+         chmod +x ~/.local/bin/sesh"
+    );
+    let download = Command::new("ssh")
+        .args(["-o", "ConnectTimeout=10", host, &download_cmd])
+        .output();
+
+    if let Ok(out) = download {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if out.status.success() && !text.contains("SESH_DOWNLOAD_FAIL") {
+            return true;
+        }
+    }
+    eprintln!("  GitHub download failed");
+
+    // Method 3: Fallback — copy local binary ONLY if same platform
     let local_os = std::env::consts::OS;
     let local_arch = std::env::consts::ARCH;
     let local_platform = format!(
@@ -1044,7 +1065,7 @@ fn deploy_to_remote(host: &str) -> bool {
 
     if local_platform != remote_platform {
         eprintln!("  Cannot deploy: local is {local_platform}, remote is {remote_platform}");
-        eprintln!("  Fix: install Node.js/npm on the remote host");
+        eprintln!("  Fix: install curl, wget, or npm on the remote host");
         return false;
     }
 
