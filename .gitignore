@@ -1,6 +1,6 @@
 # Build artifacts
 /target/
-npm/bin/
+npm/bin/sesh-*
 npm/node_modules/
 
 # OS
