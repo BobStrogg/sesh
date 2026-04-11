@@ -2,7 +2,15 @@
 # Platform-detecting wrapper — execs the correct sesh binary.
 # This file ships in the npm package so that npm's bin-linking always
 # has a target, avoiding the race where postinstall hasn't run yet.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF="$0"
+# Resolve symlinks (npm global installs symlink into a bin directory)
+while [ -L "$SELF" ]; do
+  DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  # Handle relative symlink
+  case "$SELF" in /*) ;; *) SELF="$DIR/$SELF" ;; esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 case "$ARCH" in
