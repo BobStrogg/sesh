@@ -7,6 +7,12 @@ Named persistent shell sessions — zero config, single binary.
 ## Install
 
 ```bash
+curl -fsSL "https://github.com/BobStrogg/sesh/releases/latest/download/sesh-$(uname -s | tr A-Z a-z)-$(uname -m | sed 's/arm64/aarch64/')" -o ~/.local/bin/sesh && chmod +x ~/.local/bin/sesh
+```
+
+Or via npm:
+
+```bash
 npm install -g @bobstrogg/sesh
 ```
 
