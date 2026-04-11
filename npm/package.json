@@ -2,6 +2,7 @@
   "name": "@bobstrogg/sesh",
   "version": "0.1.4",
   "description": "Named persistent shell sessions — zero config, single binary",
+  "author": "Chris Cavanagh <github@chriscavanagh.com>",
   "license": "MIT",
   "repository": {
     "type": "git",

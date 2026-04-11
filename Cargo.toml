@@ -2,6 +2,7 @@
 name = "sesh"
 version = "0.1.4"
 edition = "2021"
+authors = ["Chris Cavanagh <github@chriscavanagh.com>"]
 description = "Named persistent shell sessions — zero config, single binary"
 license = "MIT"
 repository = "https://github.com/bobstrogg/sesh"
