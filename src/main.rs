@@ -538,9 +538,24 @@ fn run_client(name: &str) -> io::Result<()> {
             if n <= 0 {
                 break Ok(());
             }
-            let written = unsafe { libc::write(1, buf.as_ptr() as *const _, n as usize) };
-            if written < 0 {
-                break Ok(()); // stdout broken (SSH dropped)
+            let mut off = 0usize;
+            let total = n as usize;
+            while off < total {
+                let written = unsafe {
+                    libc::write(1, buf[off..].as_ptr() as *const _, total - off)
+                };
+                if written > 0 {
+                    off += written as usize;
+                } else if written < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break; // stdout truly broken
+                }
+            }
+            if off < total {
+                break Ok(()); // stdout broken
             }
         }
     };
