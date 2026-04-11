@@ -7,7 +7,7 @@ Named persistent shell sessions — zero config, single binary.
 ## Install
 
 ```bash
-npm install -g sesh-cli
+npm install -g @bobstrogg/sesh
 ```
 
 Or build from source:

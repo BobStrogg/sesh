@@ -1,5 +1,5 @@
 {
-  "name": "sesh-cli",
+  "name": "@bobstrogg/sesh",
   "version": "0.1.0",
   "description": "Named persistent shell sessions — zero config, single binary",
   "license": "MIT",
