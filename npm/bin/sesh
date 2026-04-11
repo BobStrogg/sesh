@@ -1,0 +1,16 @@
+#!/bin/sh
+# Platform-detecting wrapper — execs the correct sesh binary.
+# This file ships in the npm package so that npm's bin-linking always
+# has a target, avoiding the race where postinstall hasn't run yet.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m)"
+case "$ARCH" in
+  arm64) ARCH="aarch64" ;;
+esac
+BIN="$SCRIPT_DIR/sesh-${OS}-${ARCH}"
+if [ ! -x "$BIN" ]; then
+  echo "sesh: no binary for ${OS}-${ARCH}" >&2
+  exit 1
+fi
+exec "$BIN" "$@"

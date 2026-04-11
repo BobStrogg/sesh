@@ -1,35 +1,6 @@
-const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-
-const PLATFORM_MAP = {
-  "linux-x64": "sesh-linux-x86_64",
-  "linux-arm64": "sesh-linux-aarch64",
-  "darwin-x64": "sesh-darwin-x86_64",
-  "darwin-arm64": "sesh-darwin-aarch64",
-};
-
-const key = `${os.platform()}-${os.arch()}`;
-const binary = PLATFORM_MAP[key];
-
-if (!binary) {
-  console.error(`sesh: unsupported platform ${key}`);
-  process.exit(1);
-}
-
-const binDir = path.join(__dirname, "bin");
-const src = path.join(binDir, binary);
-const dest = path.join(binDir, "sesh");
-
-if (!fs.existsSync(src)) {
-  console.error(`sesh: binary not found: ${src}`);
-  process.exit(1);
-}
-
-// Copy platform binary to the `sesh` entry point
-fs.copyFileSync(src, dest);
-fs.chmodSync(dest, 0o755);
 
 // Set up shell completions
 try {
@@ -72,5 +43,3 @@ try {
     }
   }
 } catch {}
-
-console.log(`Installed sesh for ${key}`);
