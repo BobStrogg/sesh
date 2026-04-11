@@ -1,0 +1,39 @@
+{
+  "name": "sesh-cli",
+  "version": "0.1.0",
+  "description": "Named persistent shell sessions — zero config, single binary",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bobstrogg/sesh.git"
+  },
+  "homepage": "https://github.com/bobstrogg/sesh",
+  "bin": {
+    "sesh": "bin/sesh"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/",
+    "install.js"
+  ],
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "keywords": [
+    "session",
+    "terminal",
+    "shell",
+    "pty",
+    "tmux",
+    "screen",
+    "dtach",
+    "persistent"
+  ]
+}
