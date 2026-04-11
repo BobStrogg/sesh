@@ -1,0 +1,17 @@
+[package]
+name = "sesh"
+version = "0.1.0"
+edition = "2021"
+description = "Named persistent shell sessions — zero config, single binary"
+license = "MIT"
+repository = "https://github.com/bobstrogg/sesh"
+homepage = "https://github.com/bobstrogg/sesh"
+keywords = ["session", "terminal", "shell", "pty", "tmux"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+nix = { version = "0.29", features = ["term", "signal", "process", "poll", "fs"] }
+
+[profile.release]
+strip = true
+lto = true

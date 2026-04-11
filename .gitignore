@@ -1,0 +1,9 @@
+# Build artifacts
+/target/
+npm/bin/
+npm/node_modules/
+
+# OS
+.DS_Store
+*.swp
+*~
