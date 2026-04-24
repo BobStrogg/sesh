@@ -538,6 +538,8 @@ fn run_client(name: &str) -> io::Result<()> {
             if n <= 0 {
                 break Ok(());
             }
+            // Loop on write — stdout can return partial writes (macOS PIPE_BUF=512).
+            // Dropping bytes mid-escape-sequence corrupts terminal state.
             let mut off = 0usize;
             let total = n as usize;
             while off < total {
