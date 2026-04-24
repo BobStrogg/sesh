@@ -1011,8 +1011,10 @@ fn ssh_attach(host: &str, remote_args: &[&str]) -> ! {
 
 /// Detect remote OS/arch and return the binary name (e.g. "sesh-linux-x86_64").
 fn detect_remote_platform(host: &str) -> Option<String> {
+    use std::process::Stdio;
     let output = Command::new("ssh")
         .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", host, "uname -s; uname -m"])
+        .stderr(Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -1049,6 +1051,7 @@ fn deploy_to_remote(host: &str) -> bool {
 
     // Method 1: Install via npm on the remote (preferred, no auth needed)
     let npm_install = Command::new("ssh")
+        .stderr(std::process::Stdio::null())
         .args([
             "-o", "ConnectTimeout=10",
             host,
@@ -1065,6 +1068,7 @@ fn deploy_to_remote(host: &str) -> bool {
         if out.status.success() && !text.contains("SESH_NPM_FAIL") {
             // Ensure it's also at ~/.local/bin/sesh for consistency
             let _ = Command::new("ssh")
+                .stderr(std::process::Stdio::null())
                 .args([host, "mkdir -p ~/.local/bin && command -v sesh >/dev/null && ln -sf $(command -v sesh) ~/.local/bin/sesh 2>/dev/null || true"])
                 .status();
             return true;
@@ -1081,6 +1085,7 @@ fn deploy_to_remote(host: &str) -> bool {
          chmod +x ~/.local/bin/sesh"
     );
     let download = Command::new("ssh")
+        .stderr(std::process::Stdio::null())
         .args(["-o", "ConnectTimeout=10", host, &download_cmd])
         .output();
 
@@ -1119,10 +1124,12 @@ fn deploy_to_remote(host: &str) -> bool {
 
 /// SCP a local file to the remote's ~/.local/bin/sesh
 fn deploy_file_to_remote(host: &str, local_path: &str) -> bool {
-    let _ = Command::new("ssh").args([host, "mkdir", "-p", "~/.local/bin"]).status();
-    let _ = Command::new("ssh").args([host, "rm", "-f", "~/.local/bin/sesh"]).status();
-    let scp = Command::new("scp").args(["-q", local_path, &format!("{host}:.local/bin/sesh")]).status();
-    let _ = Command::new("ssh").args([host, "chmod", "+x", "~/.local/bin/sesh"]).status();
+    use std::process::Stdio;
+    let null = || Stdio::null();
+    let _ = Command::new("ssh").args([host, "mkdir", "-p", "~/.local/bin"]).stderr(null()).status();
+    let _ = Command::new("ssh").args([host, "rm", "-f", "~/.local/bin/sesh"]).stderr(null()).status();
+    let scp = Command::new("scp").args(["-q", local_path, &format!("{host}:.local/bin/sesh")]).stderr(null()).status();
+    let _ = Command::new("ssh").args([host, "chmod", "+x", "~/.local/bin/sesh"]).stderr(null()).status();
     let _ = fs::remove_file(local_path);
     scp.map_or(false, |s| s.success())
 }
@@ -1135,6 +1142,7 @@ fn ensure_remote_sesh(host: &str) {
 
     let check = Command::new("ssh")
         .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", host, "test", "-x", "~/.local/bin/sesh"])
+        .stderr(std::process::Stdio::null())
         .status()
         .ok();
 
@@ -1171,6 +1179,7 @@ fn upgrade_all_remotes() {
     let hosts: Vec<String> = match fs::read_dir(&remotes) {
         Ok(entries) => entries
             .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().ends_with(".sessions"))
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect(),
         Err(_) => {
