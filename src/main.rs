@@ -120,7 +120,7 @@ fn install_winch_handler() {
 }
 
 // ── Scrollback buffer ─────────────────────────────────────────────────────
-const SCROLLBACK_SIZE: usize = 32 * 1024; // 32KB — several screenfuls
+const SCROLLBACK_SIZE: usize = 4 * 1024; // 4KB — about a screenful
 
 struct Scrollback {
     data: Vec<u8>,
@@ -593,10 +593,7 @@ fn create_or_attach(name: &str, dir: Option<&str>) -> io::Result<()> {
                 // Found on exactly one remote
                 let host = &remote_hosts[0];
                 eprintln!("Connecting to '{name}' on {host}...");
-                let status = Command::new("ssh")
-                    .args(["-t", host, "~/.local/bin/sesh", name])
-                    .status();
-                exit(status.map_or(1, |s| s.code().unwrap_or(1)));
+                ssh_attach(host, &[name]);
             }
             _ => {
                 // Found on multiple remotes, prompt
@@ -609,10 +606,7 @@ fn create_or_attach(name: &str, dir: Option<&str>) -> io::Result<()> {
                 match idx {
                     Some(i) => {
                         let host = &remote_hosts[i];
-                        let status = Command::new("ssh")
-                            .args(["-t", host, "~/.local/bin/sesh", name])
-                            .status();
-                        exit(status.map_or(1, |s| s.code().unwrap_or(1)));
+                        ssh_attach(host, &[name]);
                     }
                     None => {
                         eprintln!("Invalid selection.");
@@ -983,6 +977,41 @@ fn kill_session(name: &str) {
 const NPM_PACKAGE: &str = "@bobstrogg/sesh";
 const GITHUB_RELEASE_URL: &str = "https://github.com/BobStrogg/sesh/releases/latest/download";
 
+/// SSH to a remote host and attach to a session, with auto-reconnect on drops.
+/// Exit code 0 (clean detach) exits normally. Non-zero (connection lost) retries.
+/// Ctrl-C stops the retry loop.
+fn ssh_attach(host: &str, remote_args: &[&str]) -> ! {
+    use std::process::Stdio;
+    let mut first = true;
+    loop {
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-t").arg(host).arg("~/.local/bin/sesh");
+        for arg in remote_args {
+            cmd.arg(arg);
+        }
+        // Suppress SSH's own stderr ("Broken pipe", "Connection closed", etc.)
+        // on reconnect attempts — we show our own message instead.
+        if !first {
+            cmd.stderr(Stdio::null());
+        }
+        first = false;
+        let status = cmd.status();
+
+        match status {
+            Ok(s) if s.code() == Some(0) => exit(0), // Clean detach
+            Ok(s) => {
+                let code = s.code().unwrap_or(1);
+                eprintln!("\r\nConnection lost (exit {code}). Reconnecting in 3s... (Ctrl-C to abort)");
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+            Err(e) => {
+                eprintln!("\r\nSSH error: {e}. Reconnecting in 3s... (Ctrl-C to abort)");
+                std::thread::sleep(std::time::Duration::from_secs(3));
+            }
+        }
+    }
+}
+
 /// Detect remote OS/arch and return the binary name (e.g. "sesh-linux-x86_64").
 fn detect_remote_platform(host: &str) -> Option<String> {
     let output = Command::new("ssh")
@@ -1209,13 +1238,8 @@ fn remote_dispatch(host: &str, args: &[String]) {
         }
         "help" | "-h" | "--help" => show_help(),
         _ => {
-            let mut cmd = Command::new("ssh");
-            cmd.arg("-t").arg(host).arg("~/.local/bin/sesh");
-            for arg in args {
-                cmd.arg(arg);
-            }
-            let status = cmd.status();
-            exit(status.map_or(1, |s| s.code().unwrap_or(1)));
+            let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
+            ssh_attach(host, &str_args);
         }
     }
 }
