@@ -804,8 +804,6 @@ fn list_all() {
             if num_remotes == 0 {
                 if !has_output {
                     println!("No active sessions.");
-                    println!();
-                    show_help();
                 }
                 return;
             }
@@ -875,8 +873,7 @@ fn list_all() {
 
     if !has_output {
         println!("No active sessions.");
-        println!();
-        show_help();
+        println!("Run `sesh help` for usage.");
     }
 }
 
