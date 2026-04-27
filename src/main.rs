@@ -60,6 +60,68 @@ fn pid_path(name: &str) -> PathBuf { sesh_dir().join(format!("{name}.pid")) }
 fn remotes_dir() -> PathBuf { sesh_dir().join("remotes") }
 fn remote_cache_path(host: &str) -> PathBuf { remotes_dir().join(format!("{host}.sessions")) }
 
+// Local sesh version, embedded at compile time from Cargo.toml.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Marker file written when this version of sesh has deployed itself to a
+// remote. Embedding the version in the filename means a new local sesh
+// release auto-invalidates older markers and triggers a redeploy on the
+// next `sesh @<host>` — without the user having to run `sesh upgrade`.
+fn remote_marker_path(host: &str) -> PathBuf {
+    remotes_dir().join(format!("{host}.v{VERSION}"))
+}
+
+// Extract the host alias from a marker filename. Accepts both the new
+// versioned format (`<host>.v<MAJOR>.<MINOR>.<PATCH>`) and legacy bare
+// markers (`<host>`) from pre-versioned releases. Skips session-cache
+// sidecars (`.sessions`).
+fn alias_from_marker(filename: &str) -> Option<&str> {
+    if filename.ends_with(".sessions") {
+        return None;
+    }
+    if let Some(idx) = filename.rfind(".v") {
+        let suffix = &filename[idx + 2..];
+        let parts: Vec<&str> = suffix.split('.').collect();
+        if parts.len() == 3
+            && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Some(&filename[..idx]);
+        }
+    }
+    // Legacy bare marker (pre-versioned release).
+    Some(filename)
+}
+
+// Sorted, deduplicated list of known remote host aliases.
+fn list_known_remotes() -> Vec<String> {
+    let Ok(entries) = fs::read_dir(remotes_dir()) else {
+        return vec![];
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| alias_from_marker(&e.file_name().to_string_lossy()).map(str::to_string))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+// After a successful redeploy, drop any legacy bare marker and any older
+// versioned markers for the same host. Idempotent.
+fn cleanup_old_markers(host: &str) {
+    let current = format!("{host}.v{VERSION}");
+    let Ok(entries) = fs::read_dir(remotes_dir()) else { return; };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == current || name.ends_with(".sessions") {
+            continue;
+        }
+        if alias_from_marker(&name).map(|a| a == host).unwrap_or(false) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn validate_name(name: &str) {
     if name.is_empty()
         || !name
@@ -634,20 +696,7 @@ fn create_or_attach(name: &str, dir: Option<&str>) -> io::Result<()> {
 
 /// Search all known remotes for a session with the given name.
 fn find_remote_sessions(name: &str) -> Vec<String> {
-    let remotes = remotes_dir();
-    if !remotes.exists() {
-        return vec![];
-    }
-
-    let hosts: Vec<String> = match fs::read_dir(&remotes) {
-        Ok(entries) => entries
-            .flatten()
-            .filter(|e| !e.file_name().to_string_lossy().ends_with(".sessions"))
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect(),
-        Err(_) => return vec![],
-    };
-
+    let hosts = list_known_remotes();
     if hosts.is_empty() {
         return vec![];
     }
@@ -777,10 +826,8 @@ fn list_all() {
     let mut stdout = io::stdout();
 
     let local = list_local_sessions();
-    let has_remotes = remotes_dir().exists()
-        && fs::read_dir(remotes_dir())
-            .map(|e| e.filter(|f| !f.as_ref().map_or(true, |f| f.file_name().to_string_lossy().ends_with(".sessions"))).count() > 0)
-            .unwrap_or(false);
+    let hosts = list_known_remotes();
+    let has_remotes = !hosts.is_empty();
 
     if !local.is_empty() {
         if has_remotes {
@@ -793,83 +840,68 @@ fn list_all() {
     }
 
     // Query remotes in parallel, streaming results as they arrive
-    let remotes = remotes_dir();
-    if remotes.exists() {
-        if let Ok(entries) = fs::read_dir(&remotes) {
-            let hosts: Vec<String> = entries
-                .flatten()
-                .filter(|e| !e.file_name().to_string_lossy().ends_with(".sessions"))
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect();
+    if has_remotes {
+        let num_remotes = hosts.len();
 
-            let num_remotes = hosts.len();
-            if num_remotes == 0 {
-                if !has_output {
-                    println!("No active sessions.");
+        // Print initial progress line
+        println!("\x1b[2m[0/{num_remotes} remotes]\x1b[0m");
+        let _ = stdout.flush();
+
+        // Spawn threads that send results via channel
+        let (tx, rx) = mpsc::channel();
+        for host in hosts {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let result = query_remote_host(&host);
+                let _ = tx.send((host, result));
+            });
+        }
+        drop(tx);
+
+        let mut completed = 0;
+        for (host, result) in rx {
+            completed += 1;
+
+            // Move up 1 line and clear (overwrite progress)
+            print!("\x1b[1A\x1b[K");
+
+            // Print separator if needed
+            if has_output { println!(); }
+
+            // Print result
+            match result {
+                Ok(Some(text)) => {
+                    println!("{host}:");
+                    print!("{text}");
                 }
-                return;
-            }
-
-            // Print initial progress line
-            println!("\x1b[2m[0/{num_remotes} remotes]\x1b[0m");
-            let _ = stdout.flush();
-
-            // Spawn threads that send results via channel
-            let (tx, rx) = mpsc::channel();
-            for host in hosts {
-                let tx = tx.clone();
-                std::thread::spawn(move || {
-                    let result = query_remote_host(&host);
-                    let _ = tx.send((host, result));
-                });
-            }
-            drop(tx);
-
-            let mut completed = 0;
-            for (host, result) in rx {
-                completed += 1;
-
-                // Move up 1 line and clear (overwrite progress)
-                print!("\x1b[1A\x1b[K");
-
-                // Print separator if needed
-                if has_output { println!(); }
-
-                // Print result
-                match result {
-                    Ok(Some(text)) => {
-                        println!("{host}:");
-                        print!("{text}");
-                    }
-                    Ok(None) => {
-                        println!("{host}: \x1b[2m(no sessions)\x1b[0m");
-                    }
-                    Err(reason) => {
-                        let cache = remote_cache_path(&host);
-                        if let Ok(cached) = fs::read_to_string(&cache) {
-                            if !cached.trim().is_empty() {
-                                println!("{host}: \x1b[2m({reason}, showing cached)\x1b[0m");
-                                for line in cached.lines() {
-                                    if !line.trim().is_empty() {
-                                        println!("{line}");
-                                    }
+                Ok(None) => {
+                    println!("{host}: \x1b[2m(no sessions)\x1b[0m");
+                }
+                Err(reason) => {
+                    let cache = remote_cache_path(&host);
+                    if let Ok(cached) = fs::read_to_string(&cache) {
+                        if !cached.trim().is_empty() {
+                            println!("{host}: \x1b[2m({reason}, showing cached)\x1b[0m");
+                            for line in cached.lines() {
+                                if !line.trim().is_empty() {
+                                    println!("{line}");
                                 }
-                            } else {
-                                println!("{host}: \x1b[2m({reason})\x1b[0m");
                             }
                         } else {
                             println!("{host}: \x1b[2m({reason})\x1b[0m");
                         }
+                    } else {
+                        println!("{host}: \x1b[2m({reason})\x1b[0m");
                     }
                 }
-                has_output = true;
-
-                // Print updated progress (if not done)
-                if completed < num_remotes {
-                    println!("\x1b[2m[{completed}/{num_remotes} remotes]\x1b[0m");
-                }
-                let _ = stdout.flush();
             }
+            has_output = true;
+
+            // Print updated progress (if not done)
+            if completed < num_remotes {
+                println!("\x1b[2m[{completed}/{num_remotes} remotes]\x1b[0m");
+            }
+            let _ = stdout.flush();
         }
     }
 
@@ -1137,27 +1169,25 @@ fn deploy_file_to_remote(host: &str, local_path: &str) -> bool {
 }
 
 fn ensure_remote_sesh(host: &str) {
-    let marker = remotes_dir().join(host);
+    let marker = remote_marker_path(host);
     if marker.exists() {
+        // We've already deployed *this* version of sesh to this host.
         return;
     }
 
-    let check = Command::new("ssh")
-        .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", host, "test", "-x", "~/.local/bin/sesh"])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok();
-
-    if check.map_or(true, |s| !s.success()) {
-        eprintln!("Deploying sesh to {host}...");
-        if !deploy_to_remote(host) {
-            return;
-        }
-        eprintln!("Done.");
+    // Either the remote has never seen sesh, or it has an older version.
+    // Either way, push our current binary so the remote and local stay in
+    // sync. Older markers (legacy bare or older `.v*`) are cleaned up
+    // after a successful deploy.
+    eprintln!("Deploying sesh to {host}...");
+    if !deploy_to_remote(host) {
+        return;
     }
+    eprintln!("Done.");
 
     let _ = fs::create_dir_all(remotes_dir());
-    let _ = fs::write(marker, "");
+    let _ = fs::write(&marker, "");
+    cleanup_old_markers(host);
 }
 
 fn deploy_remote(host: &str) {
@@ -1167,29 +1197,13 @@ fn deploy_remote(host: &str) {
         exit(1);
     }
     let _ = fs::create_dir_all(remotes_dir());
-    let _ = fs::write(remotes_dir().join(host), "");
+    let _ = fs::write(remote_marker_path(host), "");
+    cleanup_old_markers(host);
     eprintln!("Done.");
 }
 
 fn upgrade_all_remotes() {
-    let remotes = remotes_dir();
-    if !remotes.exists() {
-        eprintln!("No known remotes.");
-        return;
-    }
-
-    let hosts: Vec<String> = match fs::read_dir(&remotes) {
-        Ok(entries) => entries
-            .flatten()
-            .filter(|e| !e.file_name().to_string_lossy().ends_with(".sessions"))
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect(),
-        Err(_) => {
-            eprintln!("No known remotes.");
-            return;
-        }
-    };
-
+    let hosts = list_known_remotes();
     if hosts.is_empty() {
         eprintln!("No known remotes.");
         return;
@@ -1201,6 +1215,8 @@ fn upgrade_all_remotes() {
         eprintln!("Deploying sesh to {host}...");
         if deploy_to_remote(host) {
             eprintln!("  OK");
+            let _ = fs::write(remote_marker_path(host), "");
+            cleanup_old_markers(host);
             ok += 1;
         } else {
             eprintln!("  FAILED");
@@ -1265,15 +1281,8 @@ fn export_sessions() {
     }
 
     // Remote sessions (query in parallel)
-    let remotes = remotes_dir();
-    if !remotes.exists() {
-        return;
-    }
-    if let Ok(entries) = fs::read_dir(&remotes) {
-        let hosts: Vec<String> = entries
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
+    let hosts = list_known_remotes();
+    if !hosts.is_empty() {
 
         let handles: Vec<_> = hosts
             .into_iter()
@@ -1525,13 +1534,8 @@ fn main() {
             }
         }
         Some("--hosts") => {
-            let remotes = remotes_dir();
-            if remotes.exists() {
-                if let Ok(entries) = fs::read_dir(&remotes) {
-                    for entry in entries.flatten() {
-                        println!("@{}", entry.file_name().to_string_lossy());
-                    }
-                }
+            for alias in list_known_remotes() {
+                println!("@{alias}");
             }
         }
         Some(s) if s.starts_with('@') => {
@@ -1555,5 +1559,47 @@ fn main() {
                 exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::alias_from_marker;
+
+    #[test]
+    fn parses_versioned_marker() {
+        assert_eq!(alias_from_marker("host1.example.com.v0.2.6"), Some("host1.example.com"));
+        assert_eq!(alias_from_marker("host.v10.20.30"), Some("host"));
+    }
+
+    #[test]
+    fn accepts_legacy_bare_marker() {
+        assert_eq!(alias_from_marker("host1.example.com"), Some("host1.example.com"));
+        assert_eq!(alias_from_marker("simple-host"), Some("simple-host"));
+    }
+
+    #[test]
+    fn skips_session_cache_sidecars() {
+        assert_eq!(alias_from_marker("host1.example.com.sessions"), None);
+        assert_eq!(alias_from_marker("anything.sessions"), None);
+    }
+
+    #[test]
+    fn rejects_malformed_version_suffix() {
+        // not 3 dotted segments
+        assert_eq!(alias_from_marker("host.v0.2"), Some("host.v0.2"));
+        // non-numeric segments — falls through to legacy bare marker
+        assert_eq!(alias_from_marker("host.vfoo.bar.baz"), Some("host.vfoo.bar.baz"));
+        // empty segments
+        assert_eq!(alias_from_marker("host.v..2"), Some("host.v..2"));
+    }
+
+    #[test]
+    fn handles_alias_with_dots() {
+        // FQDN-style alias should round-trip cleanly
+        assert_eq!(
+            alias_from_marker("a.b.c.d.v1.2.3"),
+            Some("a.b.c.d"),
+        );
     }
 }
