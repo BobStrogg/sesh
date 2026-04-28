@@ -1414,6 +1414,7 @@ Usage:
   sesh import [file]         Recreate sessions from export (- for stdin)
   sesh completions <shell>   Print shell completions (bash, zsh)
   sesh help                  Show this help
+  sesh version               Print version (--version, -V)
 
 Detach with Ctrl-\\
 Hosts use SSH config names (e.g. \"Host prod\" in ~/.ssh/config).
@@ -1428,7 +1429,7 @@ fn print_completions(shell: &str) {
     local cur prev words cword
     _init_completion || return
 
-    local cmds="list ls kill rm deploy upgrade export import completions help"
+    local cmds="list ls kill rm deploy upgrade export import completions help version"
 
     if [[ $cword -eq 1 ]]; then
         local sessions
@@ -1480,7 +1481,7 @@ _sesh_hosts() {{
 
 _sesh() {{
     local -a commands
-    commands=(list ls kill rm deploy upgrade export import completions help)
+    commands=(list ls kill rm deploy upgrade export import completions help version)
 
     if (( CURRENT == 2 )); then
         _alternative \
@@ -1541,6 +1542,7 @@ fn main() {
         }
         Some("upgrade") => upgrade_all_remotes(),
         Some("help" | "-h" | "--help") => show_help(),
+        Some("version" | "-V" | "--version") => println!("sesh {VERSION}"),
         Some("export") => export_sessions(),
         Some("import") => {
             let file = args.get(1).map(String::as_str).unwrap_or("-");
