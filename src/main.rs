@@ -731,6 +731,11 @@ fn find_remote_sessions(name: &str) -> Vec<String> {
                 };
 
                 for line in text.lines() {
+                    // Only consider session-data lines (indented with two spaces).
+                    // Skips "No active sessions." help text from older remotes.
+                    if !line.starts_with("  ") {
+                        continue;
+                    }
                     let first = line.split_whitespace().next().unwrap_or("");
                     if first == name {
                         return Some(host);
@@ -906,8 +911,14 @@ fn list_all() {
     }
 
     if !has_output {
-        println!("No active sessions.");
-        println!("Run `sesh help` for usage.");
+        // Only show the friendly empty-state message in an interactive terminal.
+        // When `sesh list` is invoked over SSH (e.g. by another sesh querying
+        // this host as a remote), stdout is a pipe — emit nothing, so the
+        // caller sees "(no sessions)" rather than the help text.
+        if unsafe { libc::isatty(1) } == 1 {
+            println!("No active sessions.");
+            println!("Run `sesh help` for usage.");
+        }
     }
 }
 
@@ -926,11 +937,17 @@ fn query_remote_host(host: &str) -> Result<Option<String>, String> {
     match output {
         Some(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout).to_string();
-            let _ = fs::write(remote_cache_path(host), &text);
-            if text.trim().is_empty() {
-                Ok(None)
-            } else {
+            // Only consider lines that look like session entries — indented
+            // with two spaces (`  name  dir`). Older remotes (pre-isatty
+            // fix) emit "No active sessions.\nRun `sesh help` for usage."
+            // when empty; treat that as no sessions, not as session data.
+            let has_sessions = text.lines().any(|l| l.starts_with("  ") && !l.trim().is_empty());
+            if has_sessions {
+                let _ = fs::write(remote_cache_path(host), &text);
                 Ok(Some(text))
+            } else {
+                let _ = fs::write(remote_cache_path(host), "");
+                Ok(None)
             }
         }
         Some(out) => {
@@ -1310,6 +1327,11 @@ fn export_sessions() {
         for handle in handles {
             if let Ok(Some((host, text))) = handle.join() {
                 for line in text.lines() {
+                    // Only consider session-data lines (indented with two spaces).
+                    // Skips "No active sessions." help text from older remotes.
+                    if !line.starts_with("  ") {
+                        continue;
+                    }
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 2 {
                         let name = parts[0];
