@@ -29,7 +29,7 @@ sesh dev .              # Create a session named "dev" in the current directory
                         # Press Ctrl-\ to detach
 sesh dev                # Reattach (searches local, then remotes)
 sesh                    # List all sessions
-sesh kill dev           # Kill a session
+sesh --kill dev         # Kill a session
 ```
 
 ## Features
@@ -40,27 +40,28 @@ sesh kill dev           # Kill a session
 - **Scrollback replay** — see recent terminal history when reattaching
 - **Tab completion** — auto-configured for bash and zsh
 - **Remote support** — manage sessions on remote hosts over SSH
-- **Cross-platform deploy** — `sesh deploy @host` installs the correct binary
+- **Cross-platform deploy** — `sesh --deploy @host` installs the correct binary
 - **Export/import** — back up and recreate your session layout
 - **No screen clearing** — does not interfere with terminal state
 
 ## Usage
 
 ```
-sesh                       List all sessions (local + remotes)
-sesh <name> [dir]          Create or attach to a session
-sesh kill <name>           Kill a session (local or remote)
+sesh                          List all sessions (local + remotes)
+sesh <name> [dir]             Create or attach to a session
+sesh --kill <name>            Kill a session (local or remote)
 
-sesh @<host>               List sessions on a remote host
-sesh @<host> <name> [dir]  Create or attach to a remote session
-sesh @<host> kill <name>   Kill a remote session
+sesh @<host>                  List sessions on a remote host
+sesh @<host> <name> [dir]     Create or attach to a remote session
+sesh @<host> --kill <name>    Kill a remote session
 
-sesh deploy @<host>        Deploy sesh to a remote host
-sesh upgrade               Redeploy sesh to all known remotes
-sesh export                Export session layout
-sesh import [file]         Recreate sessions from an export
-sesh completions <shell>   Print shell completions (bash, zsh)
-sesh help                  Show help
+sesh --deploy @<host>         Deploy sesh to a remote host
+sesh --upgrade                Redeploy sesh to all known remotes
+sesh --export                 Export session layout
+sesh --import [file]          Recreate sessions from an export
+sesh --completions <shell>    Print shell completions (bash, zsh)
+sesh --help                   Show help (-h)
+sesh --version                Print version (-V)
 ```
 
 **Detach** from a session with `Ctrl-\`.
@@ -74,14 +75,14 @@ When you run `sesh <name>` without specifying a host:
 3. **Auto-connect** — connects if found on exactly one remote
 4. **Prompt** — asks you to choose if found on multiple remotes
 
-`sesh kill` uses the same smart lookup.
+`sesh --kill` uses the same smart lookup.
 
 ## Remote sessions
 
 ```bash
 sesh @myserver dev ~/project    # Create a session on a remote host
-sesh deploy @myserver           # Deploy sesh to a remote host
-sesh upgrade                    # Redeploy to all known remotes
+sesh --deploy @myserver         # Deploy sesh to a remote host
+sesh --upgrade                  # Redeploy to all known remotes
 ```
 
 Deploy detects the remote OS/arch and installs via npm. Falls back to copying the local binary if platforms match.

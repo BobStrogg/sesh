@@ -713,7 +713,7 @@ fn find_remote_sessions(name: &str) -> Vec<String> {
                         "-o", "ConnectTimeout=5",
                         "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
                         &host,
-                        "~/.local/bin/sesh", "list",
+                        "~/.local/bin/sesh",
                     ])
                     .output()
                     .ok();
@@ -929,7 +929,7 @@ fn query_remote_host(host: &str) -> Result<Option<String>, String> {
             "-o", "ConnectTimeout=5",
             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
             host,
-            "~/.local/bin/sesh", "list",
+            "~/.local/bin/sesh",
         ])
         .output()
         .ok();
@@ -994,7 +994,7 @@ fn kill_session(name: &str) {
         1 => {
             let host = &remote_hosts[0];
             let status = Command::new("ssh")
-                .args([host, "~/.local/bin/sesh", "kill", name])
+                .args([host, "~/.local/bin/sesh", "--kill", name])
                 .status();
             exit(status.map_or(1, |s| s.code().unwrap_or(1)));
         }
@@ -1008,7 +1008,7 @@ fn kill_session(name: &str) {
                 Some(i) => {
                     let host = &remote_hosts[i];
                     let status = Command::new("ssh")
-                        .args([host, "~/.local/bin/sesh", "kill", name])
+                        .args([host, "~/.local/bin/sesh", "--kill", name])
                         .status();
                     exit(status.map_or(1, |s| s.code().unwrap_or(1)));
                 }
@@ -1246,9 +1246,9 @@ fn upgrade_all_remotes() {
 fn remote_dispatch(host: &str, args: &[String]) {
     ensure_remote_sesh(host);
 
-    if args.is_empty() || matches!(args[0].as_str(), "list" | "ls") {
+    if args.is_empty() {
         let output = Command::new("ssh")
-            .args(["-o", "ConnectTimeout=5", host, "~/.local/bin/sesh", "list"])
+            .args(["-o", "ConnectTimeout=5", host, "~/.local/bin/sesh"])
             .output()
             .ok();
         match output {
@@ -1267,17 +1267,21 @@ fn remote_dispatch(host: &str, args: &[String]) {
     }
 
     match args[0].as_str() {
-        "kill" | "rm" => {
+        "--kill" => {
             if args.len() < 2 {
-                eprintln!("Usage: sesh @{host} kill <name>");
+                eprintln!("Usage: sesh @{host} --kill <name>");
                 exit(1);
             }
             let status = Command::new("ssh")
-                .args([host, "~/.local/bin/sesh", "kill", &args[1]])
+                .args([host, "~/.local/bin/sesh", "--kill", &args[1]])
                 .status();
             exit(status.map_or(1, |s| s.code().unwrap_or(1)));
         }
-        "help" | "-h" | "--help" => show_help(),
+        "-h" | "--help" => show_help(),
+        s if s.starts_with('-') => {
+            eprintln!("Unknown option: {s}");
+            exit(1);
+        }
         _ => {
             let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
             ssh_attach(host, &str_args);
@@ -1310,7 +1314,7 @@ fn export_sessions() {
                             "-o", "ConnectTimeout=3",
                             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
                             &host,
-                            "~/.local/bin/sesh", "list",
+                            "~/.local/bin/sesh",
                         ])
                         .output()
                         .ok()?;
@@ -1400,21 +1404,21 @@ fn show_help() {
     println!(
         "\
 Usage:
-  sesh                       List all sessions (local + remotes)
-  sesh <name> [dir]          Create or attach to a local session
-  sesh kill <name>           Kill a local session
+  sesh                          List all sessions (local + remotes)
+  sesh <name> [dir]             Create or attach to a local session
+  sesh --kill <name>            Kill a local session
 
-  sesh @<host>               List sessions on a remote host
-  sesh @<host> <name> [dir]  Create or attach to a remote session
-  sesh @<host> kill <name>   Kill a remote session
+  sesh @<host>                  List sessions on a remote host
+  sesh @<host> <name> [dir]     Create or attach to a remote session
+  sesh @<host> --kill <name>    Kill a remote session
 
-  sesh deploy @<host>        Deploy/update sesh on a remote host
-  sesh upgrade               Redeploy sesh to all known remotes
-  sesh export                Export session layout to stdout
-  sesh import [file]         Recreate sessions from export (- for stdin)
-  sesh completions <shell>   Print shell completions (bash, zsh)
-  sesh help                  Show this help
-  sesh version               Print version (--version, -V)
+  sesh --deploy @<host>         Deploy/update sesh on a remote host
+  sesh --upgrade                Redeploy sesh to all known remotes
+  sesh --export                 Export session layout to stdout
+  sesh --import [file]          Recreate sessions from export (- for stdin)
+  sesh --completions <shell>    Print shell completions (bash, zsh)
+  sesh --help                   Show this help (-h)
+  sesh --version                Print version (-V)
 
 Detach with Ctrl-\\
 Hosts use SSH config names (e.g. \"Host prod\" in ~/.ssh/config).
@@ -1429,34 +1433,34 @@ fn print_completions(shell: &str) {
     local cur prev words cword
     _init_completion || return
 
-    local cmds="list ls kill rm deploy upgrade export import completions help version"
+    local flags="--kill --deploy --upgrade --export --import --completions --help --version -h -V"
 
     if [[ $cword -eq 1 ]]; then
         local sessions
         sessions="$(sesh --names 2>/dev/null)"
         local hosts
         hosts="$(sesh --hosts 2>/dev/null)"
-        COMPREPLY=( $(compgen -W "$cmds $sessions $hosts" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$flags $sessions $hosts" -- "$cur") )
         return
     fi
 
     case "${{words[1]}}" in
-        kill|rm)
+        --kill)
             local sessions
             sessions="$(sesh --names 2>/dev/null)"
             COMPREPLY=( $(compgen -W "$sessions" -- "$cur") )
             ;;
-        deploy)
+        --deploy)
             local hosts
             hosts="$(sesh --hosts 2>/dev/null)"
             COMPREPLY=( $(compgen -W "$hosts" -- "$cur") )
             ;;
-        completions)
+        --completions)
             COMPREPLY=( $(compgen -W "bash zsh" -- "$cur") )
             ;;
         @*)
             if [[ $cword -eq 2 ]]; then
-                COMPREPLY=( $(compgen -W "kill list ls" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--kill" -- "$cur") )
             fi
             ;;
     esac
@@ -1480,30 +1484,30 @@ _sesh_hosts() {{
 }}
 
 _sesh() {{
-    local -a commands
-    commands=(list ls kill rm deploy upgrade export import completions help version)
+    local -a flags
+    flags=(--kill --deploy --upgrade --export --import --completions --help --version -h -V)
 
     if (( CURRENT == 2 )); then
         _alternative \
-            'commands:command:compadd -a commands' \
+            'flags:flag:compadd -a flags' \
             'sessions:session:_sesh_sessions' \
             'hosts:host:_sesh_hosts'
         return
     fi
 
     case "${{words[2]}}" in
-        kill|rm)
+        --kill)
             _sesh_sessions
             ;;
-        deploy)
+        --deploy)
             _sesh_hosts
             ;;
-        completions)
+        --completions)
             compadd bash zsh
             ;;
         @*)
             if (( CURRENT == 3 )); then
-                compadd kill list ls
+                compadd -- --kill
             fi
             ;;
     esac
@@ -1514,7 +1518,7 @@ _sesh "$@"
         ),
         _ => {
             eprintln!("Unsupported shell: {shell}");
-            eprintln!("Usage: sesh completions <bash|zsh>");
+            eprintln!("Usage: sesh --completions <bash|zsh>");
             exit(1);
         }
     }
@@ -1524,31 +1528,31 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
     match args.first().map(String::as_str) {
-        None | Some("list") | Some("ls") => list_all(),
-        Some("kill") | Some("rm") => {
+        None => list_all(),
+        Some("--kill") => {
             if args.len() < 2 {
-                eprintln!("Usage: sesh kill <name>");
+                eprintln!("Usage: sesh --kill <name>");
                 exit(1);
             }
             validate_name(&args[1]);
             kill_session(&args[1]);
         }
-        Some("deploy") => {
+        Some("--deploy") => {
             if args.len() < 2 || !args[1].starts_with('@') {
-                eprintln!("Usage: sesh deploy @<host>");
+                eprintln!("Usage: sesh --deploy @<host>");
                 exit(1);
             }
             deploy_remote(&args[1][1..]);
         }
-        Some("upgrade") => upgrade_all_remotes(),
-        Some("help" | "-h" | "--help") => show_help(),
-        Some("version" | "-V" | "--version") => println!("sesh {VERSION}"),
-        Some("export") => export_sessions(),
-        Some("import") => {
+        Some("--upgrade") => upgrade_all_remotes(),
+        Some("-h" | "--help") => show_help(),
+        Some("-V" | "--version") => println!("sesh {VERSION}"),
+        Some("--export") => export_sessions(),
+        Some("--import") => {
             let file = args.get(1).map(String::as_str).unwrap_or("-");
             import_sessions(file);
         }
-        Some("completions") => {
+        Some("--completions") => {
             let shell = args.get(1).map(String::as_str).unwrap_or("bash");
             print_completions(shell);
         }
@@ -1565,7 +1569,7 @@ fn main() {
         Some(s) if s.starts_with('@') => {
             let host = &s[1..];
             if host.is_empty() {
-                eprintln!("Usage: sesh @<host> [command]");
+                eprintln!("Usage: sesh @<host> [<name> [dir] | --kill <name>]");
                 exit(1);
             }
             remote_dispatch(host, &args[1..]);

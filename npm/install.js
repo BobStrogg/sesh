@@ -24,11 +24,11 @@ try {
 
   if (shell === "bash") {
     rc = path.join(home, ".bashrc");
-    line = 'eval "$(sesh completions bash)"';
+    line = 'eval "$(sesh --completions bash)"';
   } else if (shell === "zsh") {
     // Try .zshrc first, fall back to .zprofile
     const candidates = [".zshrc", ".zprofile", ".zshenv"];
-    line = 'eval "$(sesh completions zsh)"';
+    line = 'eval "$(sesh --completions zsh)"';
     rc = null;
     for (const f of candidates) {
       const p = path.join(home, f);
@@ -51,7 +51,15 @@ try {
 
   if (rc && line) {
     const content = fs.existsSync(rc) ? fs.readFileSync(rc, "utf8") : "";
-    if (!content.includes("sesh completions")) {
+    if (content.includes("sesh --completions")) {
+      // Already migrated — nothing to do.
+    } else if (/sesh completions (bash|zsh)/.test(content)) {
+      // Old syntax (`sesh completions bash`) — rewrite to flag form so the
+      // shell stops erroring on startup after upgrading from <0.2.0.
+      const updated = content.replace(/sesh completions (bash|zsh)/g, "sesh --completions $1");
+      fs.writeFileSync(rc, updated);
+      console.log(`Updated tab-completion in ${rc} (sesh completions → sesh --completions)`);
+    } else {
       fs.appendFileSync(rc, `\n${line}\n`);
       console.log(`Added tab-completion to ${rc}`);
     }
