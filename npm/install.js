@@ -1,6 +1,20 @@
+const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+
+// macOS: strip quarantine xattr and ad-hoc sign the platform binary so
+// Gatekeeper doesn't kill the unsigned binary with SIGKILL on first run.
+// (The wrapper script picks the right binary at runtime; we only need to
+//  sign the one matching this machine's platform.)
+if (os.platform() === "darwin") {
+  const arch = os.arch() === "arm64" ? "aarch64" : "x86_64";
+  const bin = path.join(__dirname, "bin", `sesh-darwin-${arch}`);
+  if (fs.existsSync(bin)) {
+    try { execSync(`xattr -d com.apple.quarantine "${bin}"`, { stdio: "ignore" }); } catch {}
+    try { execSync(`codesign -s - -f "${bin}"`, { stdio: "ignore" }); } catch {}
+  }
+}
 
 // Set up shell completions
 try {
