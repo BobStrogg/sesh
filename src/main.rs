@@ -60,6 +60,24 @@ fn pid_path(name: &str) -> PathBuf { sesh_dir().join(format!("{name}.pid")) }
 fn remotes_dir() -> PathBuf { sesh_dir().join("remotes") }
 fn remote_cache_path(host: &str) -> PathBuf { remotes_dir().join(format!("{host}.sessions")) }
 
+// SSH connection multiplexing — one master persists for 10 minutes so a
+// single password prompt covers all the SSH calls a deploy makes (uname,
+// mkdir, scp, chmod, etc.). %C is OpenSSH's hash-based path token; it stays
+// short enough for the unix-socket path limit on macOS (~104 chars).
+fn ssh_ctrl_args() -> [&'static str; 6] {
+    [
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=~/.ssh/sockets/sesh-%C",
+        "-o", "ControlPersist=10m",
+    ]
+}
+
+fn ensure_ssh_sockets_dir() {
+    if let Ok(home) = env::var("HOME") {
+        let _ = fs::create_dir_all(format!("{home}/.ssh/sockets"));
+    }
+}
+
 // Local sesh version, embedded at compile time from Cargo.toml.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -709,6 +727,7 @@ fn find_remote_sessions(name: &str) -> Vec<String> {
             std::thread::spawn(move || {
                 // Try live query first
                 let output = Command::new("ssh")
+                    .args(ssh_ctrl_args())
                     .args([
                         "-o", "ConnectTimeout=5",
                         "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
@@ -925,6 +944,7 @@ fn list_all() {
 /// Query a remote host for sessions. Returns Ok(Some(text)), Ok(None), or Err(reason).
 fn query_remote_host(host: &str) -> Result<Option<String>, String> {
     let output = Command::new("ssh")
+        .args(ssh_ctrl_args())
         .args([
             "-o", "ConnectTimeout=5",
             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
@@ -994,6 +1014,7 @@ fn kill_session(name: &str) {
         1 => {
             let host = &remote_hosts[0];
             let status = Command::new("ssh")
+                .args(ssh_ctrl_args())
                 .args([host, "~/.local/bin/sesh", "--kill", name])
                 .status();
             exit(status.map_or(1, |s| s.code().unwrap_or(1)));
@@ -1008,6 +1029,7 @@ fn kill_session(name: &str) {
                 Some(i) => {
                     let host = &remote_hosts[i];
                     let status = Command::new("ssh")
+                        .args(ssh_ctrl_args())
                         .args([host, "~/.local/bin/sesh", "--kill", name])
                         .status();
                     exit(status.map_or(1, |s| s.code().unwrap_or(1)));
@@ -1033,7 +1055,7 @@ fn ssh_attach(host: &str, remote_args: &[&str]) -> ! {
     let mut first = true;
     loop {
         let mut cmd = Command::new("ssh");
-        cmd.arg("-t").arg(host).arg("~/.local/bin/sesh");
+        cmd.args(ssh_ctrl_args()).arg("-t").arg(host).arg("~/.local/bin/sesh");
         for arg in remote_args {
             cmd.arg(arg);
         }
@@ -1061,14 +1083,25 @@ fn ssh_attach(host: &str, remote_args: &[&str]) -> ! {
 }
 
 /// Detect remote OS/arch and return the binary name (e.g. "sesh-linux-x86_64").
+///
+/// This is the *first* SSH call made for a host, so it intentionally allows
+/// password auth — no `BatchMode=yes`. The ControlMaster opts mean the
+/// password (if needed) is only prompted once: subsequent SSH/scp calls in
+/// the same deploy reuse the persisted master connection.
 fn detect_remote_platform(host: &str) -> Option<String> {
-    use std::process::Stdio;
     let output = Command::new("ssh")
-        .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", host, "uname -s; uname -m"])
-        .stderr(Stdio::null())
+        .args(ssh_ctrl_args())
+        .args(["-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new", host, "uname -s; uname -m"])
         .output()
         .ok()?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let trimmed = stderr.trim();
+        if !trimmed.is_empty() {
+            // Surface the real reason (Permission denied, Connection refused,
+            // unreachable host, etc.) instead of the previous silent failure.
+            eprintln!("  ssh: {trimmed}");
+        }
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
@@ -1103,6 +1136,7 @@ fn deploy_to_remote(host: &str) -> bool {
     // Method 1: Install via npm on the remote (preferred, no auth needed)
     let npm_install = Command::new("ssh")
         .stderr(std::process::Stdio::null())
+        .args(ssh_ctrl_args())
         .args([
             "-o", "ConnectTimeout=10",
             host,
@@ -1120,6 +1154,7 @@ fn deploy_to_remote(host: &str) -> bool {
             // Ensure it's also at ~/.local/bin/sesh for consistency
             let _ = Command::new("ssh")
                 .stderr(std::process::Stdio::null())
+                .args(ssh_ctrl_args())
                 .args([host, "mkdir -p ~/.local/bin && command -v sesh >/dev/null && ln -sf $(command -v sesh) ~/.local/bin/sesh 2>/dev/null || true"])
                 .status();
             return true;
@@ -1137,6 +1172,7 @@ fn deploy_to_remote(host: &str) -> bool {
     );
     let download = Command::new("ssh")
         .stderr(std::process::Stdio::null())
+        .args(ssh_ctrl_args())
         .args(["-o", "ConnectTimeout=10", host, &download_cmd])
         .output();
 
@@ -1175,21 +1211,40 @@ fn deploy_to_remote(host: &str) -> bool {
 
 /// SCP a local file to the remote's ~/.local/bin/sesh
 fn deploy_file_to_remote(host: &str, local_path: &str) -> bool {
-    use std::process::Stdio;
-    let null = || Stdio::null();
-    let _ = Command::new("ssh").args([host, "mkdir", "-p", "~/.local/bin"]).stderr(null()).status();
-    let _ = Command::new("ssh").args([host, "rm", "-f", "~/.local/bin/sesh"]).stderr(null()).status();
-    let scp = Command::new("scp").args(["-q", local_path, &format!("{host}:.local/bin/sesh")]).stderr(null()).status();
-    let _ = Command::new("ssh").args([host, "chmod", "+x", "~/.local/bin/sesh"]).stderr(null()).status();
+    let mkdir = Command::new("ssh")
+        .args(ssh_ctrl_args())
+        .args([host, "mkdir", "-p", "~/.local/bin"])
+        .status();
+    if !mkdir.map_or(false, |s| s.success()) {
+        eprintln!("  ssh: failed to create ~/.local/bin on {host}");
+        return false;
+    }
+    let _ = Command::new("ssh")
+        .args(ssh_ctrl_args())
+        .args([host, "rm", "-f", "~/.local/bin/sesh"])
+        .status();
+    let scp = Command::new("scp")
+        .args(ssh_ctrl_args())
+        .args(["-q", local_path, &format!("{host}:.local/bin/sesh")])
+        .status();
+    let _ = Command::new("ssh")
+        .args(ssh_ctrl_args())
+        .args([host, "chmod", "+x", "~/.local/bin/sesh"])
+        .status();
     let _ = fs::remove_file(local_path);
-    scp.map_or(false, |s| s.success())
+    let ok = scp.map_or(false, |s| s.success());
+    if !ok {
+        eprintln!("  scp: failed to copy binary to {host}:~/.local/bin/sesh");
+    }
+    ok
 }
 
-fn ensure_remote_sesh(host: &str) {
+/// Returns true if the remote is ready, false if deploy failed.
+fn ensure_remote_sesh(host: &str) -> bool {
     let marker = remote_marker_path(host);
     if marker.exists() {
         // We've already deployed *this* version of sesh to this host.
-        return;
+        return true;
     }
 
     // Either the remote has never seen sesh, or it has an older version.
@@ -1198,13 +1253,17 @@ fn ensure_remote_sesh(host: &str) {
     // after a successful deploy.
     eprintln!("Deploying sesh to {host}...");
     if !deploy_to_remote(host) {
-        return;
+        eprintln!("Failed to deploy sesh to {host}.");
+        eprintln!("  If this remote needs a password, set up SSH key auth:");
+        eprintln!("    ssh-copy-id {host}");
+        return false;
     }
     eprintln!("Done.");
 
     let _ = fs::create_dir_all(remotes_dir());
     let _ = fs::write(&marker, "");
     cleanup_old_markers(host);
+    true
 }
 
 fn deploy_remote(host: &str) {
@@ -1244,10 +1303,13 @@ fn upgrade_all_remotes() {
 }
 
 fn remote_dispatch(host: &str, args: &[String]) {
-    ensure_remote_sesh(host);
+    if !ensure_remote_sesh(host) {
+        exit(1);
+    }
 
     if args.is_empty() {
         let output = Command::new("ssh")
+            .args(ssh_ctrl_args())
             .args(["-o", "ConnectTimeout=5", host, "~/.local/bin/sesh"])
             .output()
             .ok();
@@ -1273,6 +1335,7 @@ fn remote_dispatch(host: &str, args: &[String]) {
                 exit(1);
             }
             let status = Command::new("ssh")
+                .args(ssh_ctrl_args())
                 .args([host, "~/.local/bin/sesh", "--kill", &args[1]])
                 .status();
             exit(status.map_or(1, |s| s.code().unwrap_or(1)));
@@ -1310,6 +1373,7 @@ fn export_sessions() {
             .map(|host| {
                 std::thread::spawn(move || {
                     let output = Command::new("ssh")
+                        .args(ssh_ctrl_args())
                         .args([
                             "-o", "ConnectTimeout=3",
                             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
@@ -1388,9 +1452,13 @@ fn import_sessions(file: &str) {
             }
         } else {
             // Ensure remote is set up, then create session
-            ensure_remote_sesh(host);
+            if !ensure_remote_sesh(host) {
+                eprintln!("  Skipped {name} on {host} (deploy failed)");
+                continue;
+            }
             eprintln!("Creating remote session: {name} on {host} in {dir}");
             let _ = Command::new("ssh")
+                .args(ssh_ctrl_args())
                 .args([host, "~/.local/bin/sesh", name, dir])
                 .status();
             // Detach immediately (the remote sesh will create and daemonize)
@@ -1526,6 +1594,10 @@ _sesh "$@"
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+
+    // Pre-create the SSH ControlMaster socket dir so the first ssh call
+    // doesn't fail on a missing path.
+    ensure_ssh_sockets_dir();
 
     match args.first().map(String::as_str) {
         None => list_all(),
