@@ -59,6 +59,10 @@ fn meta_path(name: &str) -> PathBuf { sesh_dir().join(format!("{name}.dir")) }
 fn pid_path(name: &str) -> PathBuf { sesh_dir().join(format!("{name}.pid")) }
 fn remotes_dir() -> PathBuf { sesh_dir().join("remotes") }
 fn remote_cache_path(host: &str) -> PathBuf { remotes_dir().join(format!("{host}.sessions")) }
+// One marker per host keyed by the user's sync-list fingerprint.  When
+// the local files referenced by the sync list haven't changed since the
+// last successful push to ``host``, we skip the rsync.
+fn sync_marker_path(host: &str) -> PathBuf { remotes_dir().join(format!("{host}.synced")) }
 
 // SSH connection multiplexing — one master persists for 10 minutes so a
 // single password prompt covers all the SSH calls a deploy makes (uname,
@@ -76,6 +80,174 @@ fn ensure_ssh_sockets_dir() {
     if let Ok(home) = env::var("HOME") {
         let _ = fs::create_dir_all(format!("{home}/.ssh/sockets"));
     }
+}
+
+// ── Structured event log ─────────────────────────────────────────────────
+//
+// When ``SESH_EVENT_LOG=<path>`` is set, sesh appends JSON-Lines records
+// describing significant sync/deploy events to that file, and suppresses
+// the corresponding human-readable status lines from stderr (so consumers
+// like editor wrappers or CI runners can render their own UI without
+// duplicating the text).  When the env var is unset, behaviour is
+// completely unchanged.
+//
+// Event types (one JSON object per line, always with ``ts`` + ``event``):
+//
+//   sync_start        { host }
+//   sync_path_pushed  { path, bytes }
+//   sync_path_failed  { path, exit_code, stderr }
+//   tool_missing      { tool, path }
+//   sync_done         { ok }
+//   deploy_failed     { host, step, stderr }
+//
+// The log file is append-only (O_APPEND), so concurrent sesh invocations
+// don't clobber each other.  Failures while writing are swallowed — we
+// never let a logging hiccup break the main operation.
+
+fn event_log_path() -> Option<PathBuf> {
+    env::var("SESH_EVENT_LOG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+fn event_log_enabled() -> bool {
+    event_log_path().is_some()
+}
+
+/// Minimal ISO-8601 UTC timestamp (e.g. ``2026-04-29T19:28:46Z``) built
+/// from ``SystemTime`` + ``libc::gmtime_r`` so we don't pull chrono.
+fn event_log_now_iso() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // Cast through the time_t pointer expected by gmtime_r.  i64 matches
+    // the musl 1.2+ layout (and is correct on 64-bit glibc too); using
+    // the raw type here avoids the deprecation warning on nix's
+    // re-exported `libc::time_t` alias.
+    unsafe { libc::gmtime_r(&secs as *const i64 as *const _, &mut tm); }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+        tm.tm_hour, tm.tm_min, tm.tm_sec,
+    )
+}
+
+/// Escape a string for safe inclusion inside a JSON string literal.
+/// Handles control chars, quotes, backslashes, and \uXXXX for < 0x20.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Append one JSONL line to the event log.  ``body`` is the *inner* object
+/// contents (fields without the enclosing braces) — the ``ts`` field is
+/// added here so every event has a consistent timestamp.
+fn emit_event(body: &str) {
+    let Some(path) = event_log_path() else { return };
+    use std::io::Write;
+    let line = format!("{{\"ts\":\"{}\",{}}}", event_log_now_iso(), body);
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn emit_sync_start(host: &str) {
+    if !event_log_enabled() { return; }
+    emit_event(&format!(
+        "\"event\":\"sync_start\",\"host\":\"{}\"",
+        json_escape(host),
+    ));
+}
+
+fn emit_sync_path_pushed(path: &str, bytes: u64) {
+    if !event_log_enabled() { return; }
+    emit_event(&format!(
+        "\"event\":\"sync_path_pushed\",\"path\":\"{}\",\"bytes\":{}",
+        json_escape(path), bytes,
+    ));
+}
+
+fn emit_sync_path_failed(path: &str, exit_code: Option<i32>, stderr: &str) {
+    if !event_log_enabled() { return; }
+    let code = match exit_code {
+        Some(c) => c.to_string(),
+        None => "null".into(),
+    };
+    emit_event(&format!(
+        "\"event\":\"sync_path_failed\",\"path\":\"{}\",\"exit_code\":{},\"stderr\":\"{}\"",
+        json_escape(path), code, json_escape(stderr),
+    ));
+}
+
+fn emit_tool_missing(tool: &str, path: &str) {
+    if !event_log_enabled() { return; }
+    emit_event(&format!(
+        "\"event\":\"tool_missing\",\"tool\":\"{}\",\"path\":\"{}\"",
+        json_escape(tool), json_escape(path),
+    ));
+}
+
+fn emit_sync_done(ok: bool) {
+    if !event_log_enabled() { return; }
+    emit_event(&format!(
+        "\"event\":\"sync_done\",\"ok\":{}",
+        if ok { "true" } else { "false" },
+    ));
+}
+
+fn emit_deploy_failed(host: &str, step: &str, stderr: &str) {
+    if !event_log_enabled() { return; }
+    emit_event(&format!(
+        "\"event\":\"deploy_failed\",\"host\":\"{}\",\"step\":\"{}\",\"stderr\":\"{}\"",
+        json_escape(host), json_escape(step), json_escape(stderr),
+    ));
+}
+
+/// Sum of file sizes under a local path (file, dir, or symlink).  Used
+/// for the ``bytes`` field of ``sync_path_pushed`` events.
+fn bytes_of(local: &std::path::Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(local) else { return 0 };
+    if meta.is_file() || meta.file_type().is_symlink() {
+        return meta.len();
+    }
+    let mut total = 0u64;
+    let mut stack: Vec<PathBuf> = vec![local.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&p) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Ok(m) = fs::symlink_metadata(&path) else { continue };
+            if m.is_file() {
+                total += m.len();
+            } else if m.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    total
 }
 
 // Local sesh version, embedded at compile time from Cargo.toml.
@@ -1102,22 +1274,30 @@ fn detect_remote_platform(host: &str) -> Option<String> {
             // unreachable host, etc.) instead of the previous silent failure.
             eprintln!("  ssh: {trimmed}");
         }
+        emit_deploy_failed(host, "detect_platform", trimmed);
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() < 2 {
+        emit_deploy_failed(host, "detect_platform", "unexpected uname output");
         return None;
     }
     let os = match lines[0].trim().to_lowercase().as_str() {
         "linux" => "linux",
         "darwin" => "darwin",
-        _ => return None,
+        other => {
+            emit_deploy_failed(host, "detect_platform", &format!("unsupported OS: {other}"));
+            return None;
+        }
     };
     let arch = match lines[1].trim() {
         "x86_64" | "amd64" => "x86_64",
         "aarch64" | "arm64" => "aarch64",
-        _ => return None,
+        other => {
+            emit_deploy_failed(host, "detect_platform", &format!("unsupported arch: {other}"));
+            return None;
+        }
     };
     Some(format!("sesh-{os}-{arch}"))
 }
@@ -1214,33 +1394,342 @@ fn deploy_file_to_remote(host: &str, local_path: &str) -> bool {
     let mkdir = Command::new("ssh")
         .args(ssh_ctrl_args())
         .args([host, "mkdir", "-p", "~/.local/bin"])
-        .status();
-    if !mkdir.map_or(false, |s| s.success()) {
-        eprintln!("  ssh: failed to create ~/.local/bin on {host}");
-        return false;
+        .stderr(std::process::Stdio::piped())
+        .output();
+    match mkdir {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            eprintln!("  ssh: failed to create ~/.local/bin on {host}");
+            emit_deploy_failed(host, "mkdir", &err);
+            return false;
+        }
+        Err(e) => {
+            eprintln!("  ssh: failed to create ~/.local/bin on {host}");
+            emit_deploy_failed(host, "mkdir", &format!("spawn error: {e}"));
+            return false;
+        }
     }
     let _ = Command::new("ssh")
         .args(ssh_ctrl_args())
         .args([host, "rm", "-f", "~/.local/bin/sesh"])
         .status();
-    let scp = Command::new("scp")
+    let scp_out = Command::new("scp")
         .args(ssh_ctrl_args())
         .args(["-q", local_path, &format!("{host}:.local/bin/sesh")])
-        .status();
+        .stderr(std::process::Stdio::piped())
+        .output();
     let _ = Command::new("ssh")
         .args(ssh_ctrl_args())
         .args([host, "chmod", "+x", "~/.local/bin/sesh"])
         .status();
     let _ = fs::remove_file(local_path);
-    let ok = scp.map_or(false, |s| s.success());
-    if !ok {
-        eprintln!("  scp: failed to copy binary to {host}:~/.local/bin/sesh");
+    match scp_out {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            eprintln!("  scp: failed to copy binary to {host}:~/.local/bin/sesh");
+            emit_deploy_failed(host, "scp", &err);
+            false
+        }
+        Err(e) => {
+            eprintln!("  scp: failed to copy binary to {host}:~/.local/bin/sesh");
+            emit_deploy_failed(host, "scp", &format!("spawn error: {e}"));
+            false
+        }
     }
-    ok
+}
+
+// ── File sync ─────────────────────────────────────────────────────────────
+//
+// Users can list local paths they want mirrored to remotes in a plain
+// text config at ``~/.config/sesh/sync``.  One path per line; ``#``
+// starts a comment.  Paths are interpreted relative to ``$HOME`` and
+// pushed to the same path under ``$HOME`` on the remote.  Examples:
+//
+//     # ~/.config/sesh/sync
+//     .config/devin/skills
+//     .config/devin/hooks.v1.json
+//     bin/my-script
+//
+// On every ``sesh @host …`` invocation the listed paths are rsync'd to
+// the remote — but only if at least one of them has changed since the
+// last successful push to that host (we keep a fingerprint marker per
+// host under ``~/.local/state/sesh/remotes/``).  Setting
+// ``SESH_NO_SYNC=1`` disables this entirely, and an empty / missing
+// config means zero-config, no-surprise behaviour.
+
+fn sync_config_path() -> PathBuf {
+    PathBuf::from(env::var("HOME").unwrap_or_default())
+        .join(".config/sesh/sync")
+}
+
+/// Read the user's sync list.  Returns ``$HOME``-relative paths; lines
+/// starting with ``#`` and blank lines are ignored.  Absolute paths and
+/// paths containing ``..`` are rejected (we mirror to the same path on
+/// the remote and want to keep the mapping unambiguous).
+fn read_sync_list() -> Vec<String> {
+    let Ok(content) = fs::read_to_string(sync_config_path()) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('/') || line.contains("..") {
+            eprintln!(
+                "sesh: ignoring sync path {line:?} \
+                 (must be $HOME-relative, no '..')"
+            );
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    out
+}
+
+/// Walk a path (file or directory) under ``$HOME`` and emit
+/// ``(rel_path, mtime_secs)`` tuples for every regular file, sorted.
+/// Used to build a fingerprint of "what would we push?"
+fn fingerprint_path(rel: &str, out: &mut Vec<(String, u64)>) {
+    let home = PathBuf::from(env::var("HOME").unwrap_or_default());
+    let abs = home.join(rel);
+    let Ok(meta) = fs::symlink_metadata(&abs) else {
+        return;
+    };
+    if meta.is_file() || meta.file_type().is_symlink() {
+        let mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let len = meta.len();
+        out.push((rel.to_string(), mtime ^ len));
+        return;
+    }
+    if !meta.is_dir() {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(&abs) else { return };
+    for entry in rd.flatten() {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let child_rel = if rel.is_empty() {
+            name
+        } else {
+            format!("{}/{}", rel.trim_end_matches('/'), name)
+        };
+        fingerprint_path(&child_rel, out);
+    }
+}
+
+fn sync_fingerprint(paths: &[String]) -> String {
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    for p in paths {
+        fingerprint_path(p, &mut entries);
+    }
+    entries.sort();
+    // Stable, cheap hash — we don't need crypto-grade collision
+    // resistance, just "did anything change since last push".
+    let h: u64 = entries.iter().fold(0u64, |acc, (p, m)| {
+        let bytes = p.as_bytes();
+        let mut a = acc;
+        for &b in bytes {
+            a = a.wrapping_mul(31).wrapping_add(b as u64);
+        }
+        a.wrapping_mul(31).wrapping_add(*m)
+    });
+    format!("{:x}-{}", h, entries.len())
+}
+
+/// Push the user-configured paths to ``host`` if any of them have
+/// changed since the last successful sync.  Silently no-ops when
+/// disabled, missing config, empty config, or the rsync/scp tools
+/// aren't available.
+///
+/// When ``SESH_EVENT_LOG`` is set, per-path outcomes are written as
+/// JSONL events and the ``Syncing files to …`` / ``failed to push …``
+/// stderr lines are suppressed (consumers get their info from the log).
+fn sync_files_to_remote(host: &str) {
+    if env::var("SESH_NO_SYNC").map(|v| v == "1").unwrap_or(false) {
+        return;
+    }
+    let paths = read_sync_list();
+    if paths.is_empty() {
+        return;
+    }
+    let fingerprint = sync_fingerprint(&paths);
+    let marker = sync_marker_path(host);
+    if let Ok(existing) = fs::read_to_string(&marker) {
+        if existing.trim() == fingerprint {
+            return; // Already up to date.
+        }
+    }
+
+    let quiet = event_log_enabled();
+    if !quiet {
+        eprintln!("Syncing files to {host}...");
+    }
+    emit_sync_start(host);
+
+    let mut any_ok = false;
+    let mut failures = 0u32;
+    // Track which "tool missing" events we've already emitted so we don't
+    // spam one per path in the list when the tool isn't installed at all.
+    let mut emitted_missing_rsync = false;
+    let mut emitted_missing_scp = false;
+    let home = PathBuf::from(env::var("HOME").unwrap_or_default());
+
+    for rel in &paths {
+        let local = home.join(rel);
+        if !local.exists() {
+            if !quiet {
+                eprintln!("  skipping {rel} (not present locally)");
+            }
+            continue;
+        }
+        // Make sure the parent directory exists on the remote.  ``mkdir
+        // -p`` on the *parent*, since rsync will create the leaf.
+        if let Some(parent) = std::path::Path::new(rel).parent() {
+            let parent_str = parent.to_string_lossy();
+            if !parent_str.is_empty() {
+                let _ = Command::new("ssh")
+                    .args([
+                        "-o", "ConnectTimeout=10",
+                        "-o", "BatchMode=yes",
+                        host,
+                        "mkdir", "-p", &format!("~/{}", parent_str),
+                    ])
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+
+        // Trailing slash on dirs so rsync mirrors *contents* into the
+        // matching remote directory rather than nesting one level.
+        let local_arg = if local.is_dir() {
+            format!("{}/", local.display())
+        } else {
+            local.display().to_string()
+        };
+        let remote_arg = if local.is_dir() {
+            format!("{host}:{rel}/")
+        } else {
+            format!("{host}:{rel}")
+        };
+
+        // ── Try rsync first.  Use .output() so we can capture stderr
+        //    for the event log regardless of the quiet setting.
+        let rsync_out = Command::new("rsync")
+            .args([
+                "-az", "--delete",
+                "-e", "ssh -o ConnectTimeout=10 -o BatchMode=yes",
+                &local_arg,
+                &remote_arg,
+            ])
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .output();
+
+        let (rsync_ok, rsync_code, rsync_err, rsync_missing) = match rsync_out {
+            Ok(o) => (
+                o.status.success(),
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+                false,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (false, None, String::new(), true)
+            }
+            Err(e) => (false, None, format!("rsync: {e}"), false),
+        };
+
+        if rsync_ok {
+            emit_sync_path_pushed(rel, bytes_of(&local));
+            any_ok = true;
+            continue;
+        }
+
+        if rsync_missing && !emitted_missing_rsync {
+            emit_tool_missing("rsync", rel);
+            emitted_missing_rsync = true;
+        }
+
+        // ── Fallback: scp.  Same capture-stderr pattern.
+        let mut scp = Command::new("scp");
+        if local.is_dir() {
+            scp.arg("-rq");
+        } else {
+            scp.arg("-q");
+        }
+        scp.args(["-o", "ConnectTimeout=10"])
+            .arg(&local_arg)
+            .arg(&remote_arg)
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null());
+
+        let (scp_ok, scp_code, scp_err, scp_missing) = match scp.output() {
+            Ok(o) => (
+                o.status.success(),
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+                false,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (false, None, String::new(), true)
+            }
+            Err(e) => (false, None, format!("scp: {e}"), false),
+        };
+
+        if scp_ok {
+            emit_sync_path_pushed(rel, bytes_of(&local));
+            any_ok = true;
+            continue;
+        }
+
+        if scp_missing && !emitted_missing_scp {
+            emit_tool_missing("scp", rel);
+            emitted_missing_scp = true;
+        }
+
+        // Both attempts failed.  Report the most informative error we
+        // have — prefer rsync's (since rsync is what the user expected
+        // to run), falling back to scp's.  If both tools were missing
+        // we emit a synthetic error so the consumer still sees a
+        // sync_path_failed event paired with the tool_missing events.
+        let (err_text, err_code) = if !rsync_err.trim().is_empty() {
+            (rsync_err, rsync_code)
+        } else if !scp_err.trim().is_empty() {
+            (scp_err, scp_code)
+        } else if rsync_missing && scp_missing {
+            (String::from("no local sync tool available (rsync and scp both missing)"), None)
+        } else {
+            (String::from("rsync and scp both failed"), None)
+        };
+        emit_sync_path_failed(rel, err_code, err_text.trim());
+        failures += 1;
+        if !quiet {
+            eprintln!("  failed to push {rel}");
+        }
+    }
+
+    emit_sync_done(failures == 0);
+
+    if any_ok {
+        let _ = fs::create_dir_all(remotes_dir());
+        let _ = fs::write(&marker, fingerprint);
+    }
 }
 
 /// Returns true if the remote is ready, false if deploy failed.
 fn ensure_remote_sesh(host: &str) -> bool {
+    // First, push any user-configured files (skills, dotfiles, …) so
+    // they're in place before the user actually attaches.  This is a
+    // no-op if the user hasn't created a sync config.  We don't gate
+    // the rest of the function on this — sesh itself still wants to
+    // deploy even when sync has no rules to push.
+    sync_files_to_remote(host);
+
     let marker = remote_marker_path(host);
     if marker.exists() {
         // We've already deployed *this* version of sesh to this host.
@@ -1664,7 +2153,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::alias_from_marker;
+    use super::{alias_from_marker, json_escape};
 
     #[test]
     fn parses_versioned_marker() {
@@ -1701,5 +2190,64 @@ mod tests {
             alias_from_marker("a.b.c.d.v1.2.3"),
             Some("a.b.c.d"),
         );
+    }
+
+    // ── Event log: json_escape ────────────────────────────────────────────
+
+    #[test]
+    fn json_escape_passes_plain_strings_unchanged() {
+        assert_eq!(json_escape("hello world"), "hello world");
+        assert_eq!(json_escape(""), "");
+        assert_eq!(json_escape(".config/devin/skills"), ".config/devin/skills");
+    }
+
+    #[test]
+    fn json_escape_handles_quotes_and_backslashes() {
+        assert_eq!(json_escape("say \"hi\""), "say \\\"hi\\\"");
+        assert_eq!(json_escape("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn json_escape_handles_newlines_and_tabs() {
+        // rsync stderr commonly contains both of these.
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+        assert_eq!(json_escape("a\tb"), "a\\tb");
+        assert_eq!(json_escape("a\r\nb"), "a\\r\\nb");
+    }
+
+    #[test]
+    fn json_escape_unicode_escapes_control_chars() {
+        assert_eq!(json_escape("\x00"), "\\u0000");
+        assert_eq!(json_escape("\x1f"), "\\u001f");
+        // Non-control bytes > 0x1f should pass through.
+        assert_eq!(json_escape("\x20"), " ");
+        assert_eq!(json_escape("é"), "é");
+    }
+
+    #[test]
+    fn json_escape_produces_round_trippable_json() {
+        // Verify the escaped string is syntactically valid inside a JSON
+        // string literal: no unescaped quotes, no literal newlines, every
+        // backslash followed by a valid escape char.
+        let nasty = "ssh: Permission denied\n\"quote\"\tand a \\ backslash";
+        let escaped = json_escape(nasty);
+        for line in escaped.lines() {
+            assert_eq!(line, escaped, "escaped contained a literal newline");
+        }
+        let bytes = escaped.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'"' {
+                panic!("unescaped quote at byte {i}");
+            }
+            if b == b'\\' {
+                let next = *bytes.get(i + 1).expect("trailing backslash");
+                assert!(matches!(next, b'"' | b'\\' | b'n' | b'r' | b't' | b'b' | b'f' | b'u'));
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
     }
 }
