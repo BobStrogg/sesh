@@ -1,6 +1,6 @@
 [package]
 name = "sesh"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["Chris Cavanagh <github@chriscavanagh.com>"]
 description = "Named persistent shell sessions — zero config, single binary"
