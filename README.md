@@ -41,6 +41,8 @@ sesh --kill dev         # Kill a session
 - **Tab completion** — auto-configured for bash and zsh
 - **Remote support** — manage sessions on remote hosts over SSH
 - **Cross-platform deploy** — `sesh --deploy @host` installs the correct binary
+- **File sync** — list paths in `~/.config/sesh/sync` and they're rsynced to every remote on connect
+- **Structured event log** — `SESH_EVENT_LOG=<path>` for machine-readable sync/deploy events (JSONL)
 - **Export/import** — back up and recreate your session layout
 - **No screen clearing** — does not interfere with terminal state
 
@@ -86,6 +88,51 @@ sesh --upgrade                  # Redeploy to all known remotes
 ```
 
 Deploy detects the remote OS/arch and installs via npm. Falls back to copying the local binary if platforms match.
+
+## File sync
+
+Anything you list in `~/.config/sesh/sync` is rsync'd to every remote
+host you connect to.  Lines that start with `#` are ignored.  Paths
+must be `$HOME`-relative — they're mirrored to the same path under
+`$HOME` on the remote.
+
+```text
+# ~/.config/sesh/sync
+.config/devin/skills
+.config/devin/hooks.v1.json
+bin/my-script
+```
+
+The push is gated by a content fingerprint stored under
+`~/.local/state/sesh/remotes/<host>.synced` — re-attaching to the same
+remote without changing any of the listed files is a no-op.  Set
+`SESH_NO_SYNC=1` to disable the feature for one invocation.
+
+`rsync` is used when available (incremental, `--delete` so removed
+files are removed remotely).  When `rsync` isn't on the local
+machine, sesh falls back to `scp -r` (no delete semantics — files
+removed locally stay on the remote).
+
+## Structured event log
+
+Set `SESH_EVENT_LOG=<path>` to have sesh append JSON-Lines records of
+significant sync / deploy events to that file instead of printing
+"Syncing files …" / "failed to push …" to stderr.  Tools that embed
+sesh (editor wrappers, CI runners, anything that wants to render its
+own UI) use this to show toasts/notifications without parsing
+human-readable output.
+
+```text
+{"ts":"2026-05-12T03:45:01Z","event":"sync_start","host":"prod"}
+{"ts":"2026-05-12T03:45:01Z","event":"sync_path_pushed","path":".config/devin/skills","bytes":4096}
+{"ts":"2026-05-12T03:45:01Z","event":"sync_path_failed","path":"bin/foo","exit_code":12,"stderr":"..."}
+{"ts":"2026-05-12T03:45:01Z","event":"tool_missing","tool":"rsync","path":"bin/foo"}
+{"ts":"2026-05-12T03:45:01Z","event":"sync_done","ok":false}
+{"ts":"2026-05-12T03:45:01Z","event":"deploy_failed","host":"prod","step":"detect_platform","stderr":"..."}
+```
+
+The log file is opened `O_APPEND`, so concurrent sesh invocations can
+share a single log.  When the env var is unset, behaviour is unchanged.
 
 ## How it works
 
