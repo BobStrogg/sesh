@@ -263,10 +263,12 @@ fn remote_marker_path(host: &str) -> PathBuf {
 
 // Extract the host alias from a marker filename. Accepts both the new
 // versioned format (`<host>.v<MAJOR>.<MINOR>.<PATCH>`) and legacy bare
-// markers (`<host>`) from pre-versioned releases. Skips session-cache
-// sidecars (`.sessions`).
+// markers (`<host>`) from pre-versioned releases. Skips internal state
+// files that share the directory but aren't host markers:
+//   * `.sessions` — cached `sesh list` output
+//   * `.synced`   — file-sync content fingerprint
 fn alias_from_marker(filename: &str) -> Option<&str> {
-    if filename.ends_with(".sessions") {
+    if filename.ends_with(".sessions") || filename.ends_with(".synced") {
         return None;
     }
     if let Some(idx) = filename.rfind(".v") {
@@ -297,13 +299,18 @@ fn list_known_remotes() -> Vec<String> {
 }
 
 // After a successful redeploy, drop any legacy bare marker and any older
-// versioned markers for the same host. Idempotent.
+// versioned markers for the same host. Idempotent.  Internal state files
+// (`.sessions` cache, `.synced` sync fingerprint) are skipped — they
+// belong to the host but aren't deploy markers.
 fn cleanup_old_markers(host: &str) {
     let current = format!("{host}.v{VERSION}");
     let Ok(entries) = fs::read_dir(remotes_dir()) else { return; };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == current || name.ends_with(".sessions") {
+        if name == current
+            || name.ends_with(".sessions")
+            || name.ends_with(".synced")
+        {
             continue;
         }
         if alias_from_marker(&name).map(|a| a == host).unwrap_or(false) {
@@ -2171,6 +2178,17 @@ mod tests {
     fn skips_session_cache_sidecars() {
         assert_eq!(alias_from_marker("host1.example.com.sessions"), None);
         assert_eq!(alias_from_marker("anything.sessions"), None);
+    }
+
+    #[test]
+    fn skips_sync_fingerprint_sidecars() {
+        // The file-sync feature stores a content-fingerprint marker
+        // alongside the deploy markers under ~/.sesh/remotes/<host>.synced
+        // — these are state files, not host aliases.  Without this filter
+        // sesh would try to ssh to "<host>.synced" and fail with
+        // `Could not resolve hostname …`.
+        assert_eq!(alias_from_marker("host1.example.com.synced"), None);
+        assert_eq!(alias_from_marker("anything.synced"), None);
     }
 
     #[test]
