@@ -57,6 +57,17 @@ fn sesh_dir() -> PathBuf {
 fn sock_path(name: &str) -> PathBuf { sesh_dir().join(format!("{name}.sock")) }
 fn meta_path(name: &str) -> PathBuf { sesh_dir().join(format!("{name}.dir")) }
 fn pid_path(name: &str) -> PathBuf { sesh_dir().join(format!("{name}.pid")) }
+// Sidecar file written by the daemon when a session created via
+// ``sesh --exec`` finishes — carries the wrapped command's exit code
+// so the foreground `sesh --exec` can propagate it as its own
+// process exit status.  Format: a single integer (decimal), e.g.
+// "0\n" or "127\n".
+fn rc_path(name: &str) -> PathBuf { sesh_dir().join(format!("{name}.rc")) }
+// Scrollback dump: written by the daemon on shutdown when an
+// ``--exec`` caller is waiting.  Contains the raw PTY output from
+// the wrapped command — re-played by ``sesh --exec --print`` so the
+// caller can see what the wrapped command actually wrote.
+fn out_path(name: &str) -> PathBuf { sesh_dir().join(format!("{name}.out")) }
 fn remotes_dir() -> PathBuf { sesh_dir().join("remotes") }
 fn remote_cache_path(host: &str) -> PathBuf { remotes_dir().join(format!("{host}.sessions")) }
 // One marker per host keyed by the user's sync-list fingerprint.  When
@@ -381,6 +392,14 @@ fn install_winch_handler() {
 // ── Scrollback buffer ─────────────────────────────────────────────────────
 const SCROLLBACK_SIZE: usize = 4 * 1024; // 4KB — about a screenful
 
+// Larger buffer for ``--exec`` callers that want ``--print`` to
+// replay everything the wrapped command emitted.  256KB covers
+// typical agent output (~50-100KB after ANSI noise) with headroom;
+// long-running compiles overflow but the most-recent output (which
+// usually contains the actual result / session-id banner) is what
+// callers care about, and that's what a ring buffer keeps.
+const EXEC_SCROLLBACK_SIZE: usize = 256 * 1024;
+
 struct Scrollback {
     data: Vec<u8>,
     cap: usize,
@@ -414,6 +433,16 @@ impl Scrollback {
             }
         }
         d
+    }
+
+    /// Like ``contents()`` but without the "skip-to-first-newline"
+    /// trim — used by ``sesh --exec --print`` to dump everything
+    /// the wrapped command emitted, including any leading bytes
+    /// that arrived before the first newline.  Safe to use here
+    /// because the consumer is just ``write_all``-ing to a file or
+    /// stdout, not feeding it back into a live terminal mid-stream.
+    fn contents_full(&self) -> &[u8] {
+        &self.data
     }
 }
 
@@ -449,7 +478,13 @@ fn strip_osc_sequences(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn daemon_loop(master_raw: RawFd, listener: &UnixListener, child_pid: Pid, name: &str) {
+fn daemon_loop(
+    master_raw: RawFd,
+    listener: &UnixListener,
+    child_pid: Pid,
+    name: &str,
+    record_rc: bool,
+) {
     // Ignore SIGPIPE and SIGHUP (client disconnect shouldn't kill daemon)
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
@@ -465,12 +500,28 @@ fn daemon_loop(master_raw: RawFd, listener: &UnixListener, child_pid: Pid, name:
     let listener_raw = listener.as_raw_fd();
     let mut client: Option<UnixStream> = None;
     let mut buf = [0u8; BUF_SIZE];
-    let mut scrollback = Scrollback::new(SCROLLBACK_SIZE);
+    let mut scrollback = Scrollback::new(
+        if record_rc { EXEC_SCROLLBACK_SIZE } else { SCROLLBACK_SIZE },
+    );
+    // Captured exit status of the child, populated when waitpid()
+    // returns a terminal status (Exited / Signaled).  Only meaningful
+    // when ``record_rc`` is set — for interactive shells we never
+    // need to surface this.
+    let mut captured_rc: Option<i32> = None;
 
     loop {
         // Check child status
         match waitpid(child_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) | Err(_) => {}
+            Ok(WaitStatus::Exited(_, code)) => {
+                captured_rc = Some(code);
+                break;
+            }
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                // Match the shell convention: signal N → exit code 128+N.
+                captured_rc = Some(128 + (sig as i32));
+                break;
+            }
             _ => break,
         }
 
@@ -545,6 +596,46 @@ fn daemon_loop(master_raw: RawFd, listener: &UnixListener, child_pid: Pid, name:
         }
     }
 
+    // Final blocking waitpid: the main loop typically exits via
+    // PTY EOF (``read(master) == 0``) *before* the next non-blocking
+    // waitpid sees the child's terminal status, so we'd otherwise
+    // miss the exit code entirely.  Block here exactly once to
+    // collect it.  Only relevant when ``record_rc`` is set; for
+    // interactive shells we don't care about the code.
+    if record_rc && captured_rc.is_none() {
+        match waitpid(child_pid, None) {
+            Ok(WaitStatus::Exited(_, code)) => captured_rc = Some(code),
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                captured_rc = Some(128 + (sig as i32));
+            }
+            _ => {}
+        }
+    }
+
+    // Persist the scrollback ring so a foreground ``--print``
+    // caller can replay what the wrapped command emitted.  Only for
+    // exec sessions — interactive sessions discard their scrollback
+    // on disconnect (clients see live output via the socket).
+    //
+    // Order matters: the rc file is the foreground caller's poll
+    // signal, so write the .out file FIRST (rc file appearing
+    // implies .out is already on disk and ready to read).
+    if record_rc {
+        let _ = fs::write(out_path(name), scrollback.contents_full());
+    }
+
+    // Write the recorded exit status BEFORE socket cleanup so any
+    // foreground ``sesh --exec`` waiting on us can read it.  The
+    // foreground also unlinks the rc file once it's consumed.  We
+    // only write it for one-shot exec sessions — interactive shells
+    // have no caller to consume an exit code, and leaving an
+    // unconsumed rc file around would confuse future ``sesh --exec``
+    // runs with the same name.
+    if record_rc {
+        let code = captured_rc.unwrap_or(1);
+        let _ = fs::write(rc_path(name), format!("{code}\n"));
+    }
+
     // Cleanup
     let _ = fs::remove_file(sock_path(name));
     let _ = fs::remove_file(meta_path(name));
@@ -589,7 +680,27 @@ fn handle_client_msg(client: &mut UnixStream, master_raw: RawFd, child: Pid) -> 
 }
 
 // ── Session creation ──────────────────────────────────────────────────────
-fn create_session(name: &str, dir: &Path, shell: &str) -> io::Result<()> {
+
+/// What the daemon's inner child process runs.
+///
+/// ``Shell`` is the normal interactive flow — execs the user's login
+/// shell so attaching gives them a prompt.  ``Argv`` is the
+/// ``sesh --exec`` flow — execs a specific command line; when it
+/// finishes its exit code is recorded for the foreground sesh to
+/// surface.
+#[derive(Clone)]
+enum ChildSpec {
+    Shell(String),
+    Argv(Vec<String>),
+}
+
+fn create_session(name: &str, dir: &Path, cmd: &ChildSpec) -> io::Result<()> {
+    // When the child is a one-shot command (``Argv``), the daemon
+    // records the exit code via the .rc sidecar file so the
+    // foreground ``sesh --exec`` can propagate it.  Interactive
+    // shells don't need this — their "exit code" is just "user
+    // typed exit", which has no caller waiting on it.
+    let record_rc = matches!(cmd, ChildSpec::Argv(_));
     fs::create_dir_all(sesh_dir())?;
 
     // Create sync pipe
@@ -651,8 +762,15 @@ fn create_session(name: &str, dir: &Path, shell: &str) -> io::Result<()> {
                         }
                     }
                     let _ = env::set_current_dir(dir);
-                    let err = Command::new(shell).exec();
-                    eprintln!("sesh: exec {shell}: {err}");
+                    let err = match cmd {
+                        ChildSpec::Shell(shell) => Command::new(shell).exec(),
+                        ChildSpec::Argv(argv) => {
+                            // argv guaranteed non-empty by the caller.
+                            let bin = &argv[0];
+                            Command::new(bin).args(&argv[1..]).exec()
+                        }
+                    };
+                    eprintln!("sesh: exec: {err}");
                     exit(1);
                 }
                 Ok(ForkResult::Parent { child }) => {
@@ -688,7 +806,7 @@ fn create_session(name: &str, dir: &Path, shell: &str) -> io::Result<()> {
             }
 
             // Run event loop (never returns normally)
-            daemon_loop(master_raw, &listener, child_pid, name);
+            daemon_loop(master_raw, &listener, child_pid, name, record_rc);
             exit(0);
         }
         ForkResult::Parent { .. } => {
@@ -707,7 +825,16 @@ fn create_session(name: &str, dir: &Path, shell: &str) -> io::Result<()> {
                 ));
             }
 
-            // Attach as client
+            // Exec-mode callers (`sesh --exec`) want to wait on the
+            // child's exit silently, NOT enter raw-mode terminal
+            // attach.  Return after the daemon is ready and let the
+            // caller poll the rc sidecar.
+            if record_rc {
+                return Ok(());
+            }
+            // Interactive callers attach as a client immediately so the
+            // user starts at a usable prompt instead of an empty
+            // terminal.
             run_client(name)
         }
     }
@@ -888,7 +1015,101 @@ fn create_or_attach(name: &str, dir: Option<&str>) -> io::Result<()> {
     };
 
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    create_session(name, &dir_path, &shell)
+    create_session(name, &dir_path, &ChildSpec::Shell(shell))
+}
+
+// ── --exec (one-shot, non-interactive) ────────────────────────────────────
+
+/// Run *argv* in a fresh session named *name* and block until it
+/// finishes.  Propagates the wrapped command's exit code as the
+/// foreground sesh's own exit code so callers can rely on
+/// ``$?`` / ``status.code()`` round-tripping cleanly.
+///
+/// Design contract:
+/// * If a session *name* already exists, refuse — same precondition
+///   as `sesh <name> [dir]`.  Don't silently clobber.
+/// * The session is *attachable while running* via `sesh <name>`
+///   (or `sesh @host <name>` from another machine) — that's the
+///   primary observability mechanism.
+/// * On finish, the session auto-cleans up.  Pass `--keep` to leave
+///   the session alive (with an idle shell) so the user can attach
+///   after the fact to inspect filesystem changes etc.  (Not yet
+///   implemented — sketched here for completeness.)
+/// * Pass `--print` to dump the session's captured scrollback to
+///   stdout once it finishes.  Without it, the only way to see
+///   output is to attach interactively.
+fn exec_session_local(
+    name: &str,
+    argv: &[String],
+    print: bool,
+    _keep: bool,  // TODO: implement
+    dir: Option<&str>,
+) -> io::Result<()> {
+    if argv.is_empty() {
+        eprintln!("sesh --exec: command argv is required after '--'");
+        exit(2);
+    }
+    let sock = sock_path(name);
+    if sock.exists() && UnixStream::connect(&sock).is_ok() {
+        eprintln!("sesh --exec: session '{name}' already exists");
+        exit(1);
+    }
+    // Clear any stale rc/out files from a prior run with the same
+    // name — we'd otherwise immediately read them back and skip the
+    // new run, or replay an old run's scrollback.
+    let _ = fs::remove_file(rc_path(name));
+    let _ = fs::remove_file(out_path(name));
+
+    let dir_path = if let Some(d) = dir {
+        fs::canonicalize(d).map_err(|_| {
+            io::Error::new(io::ErrorKind::NotFound, format!("Directory not found: {d}"))
+        })?
+    } else {
+        env::current_dir()?
+    };
+
+    // Fork the daemon — same plumbing as `create_session` for shells.
+    // When it returns OK the daemon is running and the inner argv
+    // has been exec'd into the PTY.
+    create_session(name, &dir_path, &ChildSpec::Argv(argv.to_vec()))?;
+
+    // Block until the daemon writes the rc sidecar.  We deliberately
+    // DON'T connect as a client (which would race with the daemon's
+    // teardown).  Polling for the rc file is the simplest robust
+    // sync point.  ~50 ms sleep keeps the loop cheap; commands that
+    // finish quickly still see < 100 ms latency on top of their
+    // actual runtime.
+    let rc_file = rc_path(name);
+    loop {
+        if rc_file.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let rc: i32 = fs::read_to_string(&rc_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1);
+    let _ = fs::remove_file(&rc_file);
+
+    // Print captured scrollback if requested.  The daemon writes
+    // the full PTY output to ``<name>.out`` before the rc sidecar
+    // (see daemon_loop()), so by the time we're here the file is
+    // ready.  Stream it straight to our stdout — bytewise, no
+    // re-encoding, no ANSI stripping; callers that don't want
+    // raw escapes should pipe through ``ansifilter``/etc.
+    let out_file = out_path(name);
+    if print {
+        if let Ok(bytes) = fs::read(&out_file) {
+            let _ = io::stdout().write_all(&bytes);
+            // No trailing newline injected — the wrapped command's
+            // output typically ends with one already, and adding
+            // one here would corrupt binary output.
+        }
+    }
+    let _ = fs::remove_file(&out_file);
+
+    exit(rc);
 }
 
 /// Search all known remotes for a session with the given name.
@@ -1836,6 +2057,32 @@ fn remote_dispatch(host: &str, args: &[String]) {
                 .status();
             exit(status.map_or(1, |s| s.code().unwrap_or(1)));
         }
+        "--exec" => {
+            // Run a one-shot exec on the remote host.  We just shovel
+            // argv across; the remote sesh handles parsing.  Exit code
+            // = remote exit code (which itself = wrapped cmd's rc).
+            //
+            // Quoting: each arg is wrapped in single quotes with any
+            // embedded single quotes escaped as ``'\''``.  This is the
+            // standard POSIX-safe scheme — ssh joins argv with spaces
+            // and the remote shell re-parses, so we need to re-quote.
+            let quoted: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    let esc = a.replace('\'', "'\\''");
+                    format!("'{esc}'")
+                })
+                .collect();
+            let cmd = format!(
+                "~/.local/bin/sesh {}",
+                quoted.join(" "),
+            );
+            let status = Command::new("ssh")
+                .args(ssh_ctrl_args())
+                .args([host, &cmd])
+                .status();
+            exit(status.map_or(1, |s| s.code().unwrap_or(1)));
+        }
         "-h" | "--help" => show_help(),
         s if s.starts_with('-') => {
             eprintln!("Unknown option: {s}");
@@ -1942,7 +2189,7 @@ fn import_sessions(file: &str) {
             eprintln!("Creating local session: {name} in {dir}");
             let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
             if let Ok(dir_path) = fs::canonicalize(dir) {
-                let _ = create_session(name, &dir_path, &shell);
+                let _ = create_session(name, &dir_path, &ChildSpec::Shell(shell));
             } else {
                 eprintln!("  Skipped (directory not found: {dir})");
             }
@@ -1971,10 +2218,17 @@ Usage:
   sesh                          List all sessions (local + remotes)
   sesh <name> [dir]             Create or attach to a local session
   sesh --kill <name>            Kill a local session
+  sesh --exec <name> [opts] -- <cmd> [args...]
+                                Run <cmd> in a fresh session, exit with
+                                <cmd>'s return code.  Attach with
+                                `sesh <name>` while running to watch.
+                                Options: --print --keep -C <dir>
 
   sesh @<host>                  List sessions on a remote host
   sesh @<host> <name> [dir]     Create or attach to a remote session
   sesh @<host> --kill <name>    Kill a remote session
+  sesh @<host> --exec <name> [opts] -- <cmd> [args...]
+                                Same as --exec, but on a remote host.
 
   sesh --deploy @<host>         Deploy/update sesh on a remote host
   sesh --upgrade                Redeploy sesh to all known remotes
@@ -1997,7 +2251,7 @@ fn print_completions(shell: &str) {
     local cur prev words cword
     _init_completion || return
 
-    local flags="--kill --deploy --upgrade --export --import --completions --help --version -h -V"
+    local flags="--kill --exec --deploy --upgrade --export --import --completions --help --version -h -V"
 
     if [[ $cword -eq 1 ]]; then
         local sessions
@@ -2024,7 +2278,7 @@ fn print_completions(shell: &str) {
             ;;
         @*)
             if [[ $cword -eq 2 ]]; then
-                COMPREPLY=( $(compgen -W "--kill" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--kill --exec" -- "$cur") )
             fi
             ;;
     esac
@@ -2049,7 +2303,7 @@ _sesh_hosts() {{
 
 _sesh() {{
     local -a flags
-    flags=(--kill --deploy --upgrade --export --import --completions --help --version -h -V)
+    flags=(--kill --exec --deploy --upgrade --export --import --completions --help --version -h -V)
 
     if (( CURRENT == 2 )); then
         _alternative \
@@ -2113,6 +2367,64 @@ fn main() {
             deploy_remote(&args[1][1..]);
         }
         Some("--upgrade") => upgrade_all_remotes(),
+        Some("--exec") => {
+            // Usage:
+            //   sesh --exec <name> [--print] [--keep] [-C <dir>] -- <cmd> [args...]
+            //
+            // Creates a fresh session named <name>, runs <cmd> in it,
+            // returns the command's exit code as sesh's own exit code.
+            // The session is attachable WHILE RUNNING via
+            // ``sesh <name>`` so users can watch the wrapped command
+            // live.  See exec_session_local() for full semantics.
+            let mut argv: Vec<String> = Vec::new();
+            let mut name: Option<String> = None;
+            let mut print = false;
+            let mut keep = false;
+            let mut dir: Option<String> = None;
+            let mut iter = args.iter().skip(1);
+            while let Some(a) = iter.next() {
+                match a.as_str() {
+                    "--print" => print = true,
+                    "--keep" => keep = true,
+                    "-C" => {
+                        dir = iter.next().cloned();
+                    }
+                    "--" => {
+                        argv.extend(iter.by_ref().cloned());
+                        break;
+                    }
+                    s if s.starts_with('-') => {
+                        eprintln!("sesh --exec: unknown option: {s}");
+                        exit(2);
+                    }
+                    _ => {
+                        if name.is_some() {
+                            // Anything after the name (before ``--``)
+                            // is an error — keeps the CLI surface tight.
+                            eprintln!(
+                                "sesh --exec: unexpected positional {a:?}; \
+                                 did you forget '--' before the command?"
+                            );
+                            exit(2);
+                        }
+                        name = Some(a.clone());
+                    }
+                }
+            }
+            let Some(name) = name else {
+                eprintln!(
+                    "Usage: sesh --exec <name> [--print] [--keep] [-C <dir>] -- <cmd> [args...]"
+                );
+                exit(2);
+            };
+            validate_name(&name);
+            if let Err(e) = exec_session_local(
+                &name, &argv, print, keep, dir.as_deref(),
+            ) {
+                eprintln!("sesh --exec: {e}");
+                exit(1);
+            }
+        }
         Some("-h" | "--help") => show_help(),
         Some("-V" | "--version") => println!("sesh {VERSION}"),
         Some("--export") => export_sessions(),
