@@ -41,6 +41,7 @@ sesh --kill dev         # Kill a session
 - **Tab completion** — auto-configured for bash and zsh
 - **Remote support** — manage sessions on remote hosts over SSH
 - **Cross-platform deploy** — `sesh --deploy @host` installs the correct binary
+- **One-shot exec** — `sesh --exec <name> -- <cmd>` wraps a command in a watchable session and propagates its exit code
 - **File sync** — list paths in `~/.config/sesh/sync` and they're rsynced to every remote on connect
 - **Structured event log** — `SESH_EVENT_LOG=<path>` for machine-readable sync/deploy events (JSONL)
 - **Export/import** — back up and recreate your session layout
@@ -52,10 +53,17 @@ sesh --kill dev         # Kill a session
 sesh                          List all sessions (local + remotes)
 sesh <name> [dir]             Create or attach to a session
 sesh --kill <name>            Kill a session (local or remote)
+sesh --exec <name> [opts] -- <cmd> [args...]
+                              Run <cmd> in a fresh session, exit with
+                              <cmd>'s return code. Attach with
+                              `sesh <name>` while running to watch.
+                              Options: --print --keep -C <dir>
 
 sesh @<host>                  List sessions on a remote host
 sesh @<host> <name> [dir]     Create or attach to a remote session
 sesh @<host> --kill <name>    Kill a remote session
+sesh @<host> --exec <name> [opts] -- <cmd> [args...]
+                              Same as --exec, but on a remote host.
 
 sesh --deploy @<host>         Deploy sesh to a remote host
 sesh --upgrade                Redeploy sesh to all known remotes
@@ -88,6 +96,32 @@ sesh --upgrade                  # Redeploy to all known remotes
 ```
 
 Deploy detects the remote OS/arch and installs via npm. Falls back to copying the local binary if platforms match.
+
+## One-shot exec (`sesh --exec`)
+
+Wrap a single command in a fresh sesh session and propagate its exit code as sesh's own:
+
+```bash
+sesh --exec build -- cargo build --release   # exits with cargo's status
+echo $?                                       # 0 if cargo succeeded, non-zero otherwise
+```
+
+The session is **attachable while the command is running** — from anywhere:
+
+```bash
+sesh build                # watch it locally
+sesh @worker build        # watch it on a remote
+```
+
+Useful for long-running jobs you want to monitor without keeping a terminal pinned. On exit the session auto-cleans up.
+
+Options:
+
+- `--print` — also dump the command's captured output (last ~256 KB) to stdout after it finishes
+- `-C <dir>` — `cd` to *dir* before running the command
+- `--keep` — leave the session alive after the command exits (sketched; not yet implemented)
+
+For remotes, `sesh @<host> --exec ...` runs the same flow over SSH; argv is POSIX-quoted on the way over.
 
 ## File sync
 
